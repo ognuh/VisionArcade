@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { FluidParticleSandbox } from './fluidParticles';
 import { Lightning3DEngine } from './lightning3d';
 import { elasticScale02To10 } from './transitionManager';
 import type { HandPose2D } from './types';
@@ -1393,8 +1394,9 @@ export class Cosmos3DEngine {
   private sphereGeo: THREE.SphereGeometry | null = null;
   private atmoGeo: THREE.SphereGeometry | null = null;
 
-  // Shared Three.js Volumetric Plasma Lightning Engine (zero extra WebGL context / Bloom pass!)
+  // Shared Three.js Volumetric Plasma Lightning & Fluid 8,000-Particle Sandbox (zero extra WebGL context / Bloom pass)
   private lightning3D = new Lightning3DEngine();
+  private fluidSandbox = new FluidParticleSandbox();
 
   private burstPoints: THREE.Points | null = null;
   private burstMat: THREE.ShaderMaterial | null = null;
@@ -1489,6 +1491,7 @@ export class Cosmos3DEngine {
     this.scene.add(this.planetContainer);
     this.scene.add(this.bhRoot);
     this.scene.add(this.lightning3D.root);
+    this.scene.add(this.fluidSandbox.root);
     this.bhRoot.visible = false;
 
     const initW = Math.max(1, canvas.width || window.innerWidth);
@@ -1599,11 +1602,13 @@ export class Cosmos3DEngine {
     const prevBhVis = this.bhRoot.visible;
     const prevBurstVis = this.burstPoints?.visible ?? false;
     const prevLightVis = this.lightning3D.root.visible;
+    const prevFluidVis = this.fluidSandbox.root.visible;
     this.bhRoot.visible = true;
     this.lightning3D.root.visible = true;
+    this.fluidSandbox.root.visible = true;
     if (this.burstPoints) this.burstPoints.visible = true;
 
-    // Compile all shaders (Cosmos + Dissolve + 3D Lightning + UnrealBloomPass) offscreen
+    // Compile all shaders (Cosmos + Dissolve + 3D Lightning + Fluid + UnrealBloomPass) offscreen
     this.renderer.compile(this.scene, this.camera);
     this.renderer.setRenderTarget(this.sceneRT);
     this.renderer.clear();
@@ -1619,6 +1624,7 @@ export class Cosmos3DEngine {
     }
     this.bhRoot.visible = prevBhVis;
     this.lightning3D.root.visible = prevLightVis;
+    this.fluidSandbox.root.visible = prevFluidVis;
     if (this.burstPoints) this.burstPoints.visible = prevBurstVis;
     this.hasRenderedFrame = false;
   }
@@ -1637,6 +1643,10 @@ export class Cosmos3DEngine {
 
   public resetLightning(): void {
     this.lightning3D.reset();
+  }
+
+  public resetFluid(): void {
+    this.fluidSandbox.reset();
   }
 
   /** Reports whether Gargantua Black Hole is charging or active (blocks Air Swipe). */
@@ -2015,6 +2025,8 @@ export class Cosmos3DEngine {
     lightningActive: boolean;
     lightningFade: number;
     lightningEnter: number;
+    fluidActive: boolean;
+    fluidFade: number;
     hands: HandPose2D[];
     dt: number;
     viewW: number;
@@ -2027,6 +2039,8 @@ export class Cosmos3DEngine {
       lightningActive,
       lightningFade,
       lightningEnter,
+      fluidActive,
+      fluidFade,
       hands,
       dt,
       viewW,
@@ -2062,7 +2076,21 @@ export class Cosmos3DEngine {
       this.lightning3D.clear();
     }
 
-    if (anyCosmos || anyLightning) {
+    let anyFluid = false;
+    if (fluidActive && fluidFade > 0.01) {
+      anyFluid = this.fluidSandbox.update(
+        hands,
+        dt,
+        fluidFade,
+        viewW,
+        viewH,
+        (px, py) => this.screenToWorld(px, py),
+      );
+    } else {
+      this.fluidSandbox.clear();
+    }
+
+    if (anyCosmos || anyLightning || anyFluid) {
       this.renderer.setRenderTarget(this.sceneRT);
       this.renderer.clear();
       this.renderer.render(this.scene, this.camera);
@@ -2603,6 +2631,7 @@ export class Cosmos3DEngine {
       }
     });
     this.lightning3D.dispose();
+    this.fluidSandbox.dispose();
     this.sceneRT.dispose();
     this.bloomPass.dispose();
     this.composer.dispose();

@@ -275,8 +275,15 @@ export class GestureManager {
         continue;
       }
 
-      // Gate: >= 4 open fingers AND mid-screen safe Y band (0.15..0.72)
-      if (openFingers < 4 || sy < SWIPE_ZONE_MIN_Y || sy > SWIPE_ZONE_MAX_Y) {
+      // Gate: >= 4 open fingers AND safe Y band
+      // In FLUID mode, restrict Air Swipe to top-edge band (0.08..0.26) with stricter dx/speed so particle play never misfires
+      const isFluidMode = activeMode === 'FLUID';
+      const minY = isFluidMode ? 0.08 : SWIPE_ZONE_MIN_Y;
+      const maxY = isFluidMode ? 0.26 : SWIPE_ZONE_MAX_Y;
+      const minCommitDx = isFluidMode ? 0.30 : COMMIT_MIN_DX;
+      const minCommitSpeed = isFluidMode ? 1.15 : COMMIT_MIN_PEAK_SPEED;
+
+      if (openFingers < 4 || sy < minY || sy > maxY) {
         arm.armed = false;
         arm.dir = 0;
         arm.lastX = sx;
@@ -324,7 +331,7 @@ export class GestureManager {
         } else {
           // Phase 1 confirmed (>= 100ms monotonic horizontal travel): show Directional Indicator
           if (elapsedMs >= ARM_MIN_DURATION_MS && absDx > 0.05) {
-            const prog = Math.min(1, absDx / COMMIT_MIN_DX);
+            const prog = Math.min(1, absDx / minCommitDx);
             if (!bestIndicator.active || prog > bestIndicator.progress) {
               bestIndicator = {
                 active: true,
@@ -336,13 +343,13 @@ export class GestureManager {
             }
           }
 
-          // Phase 2 Commit: |Δx| >= 0.22 within 120ms-380ms, angle < ~29 deg, sufficient peak velocity
+          // Phase 2 Commit: |Δx| >= minCommitDx within 120ms-380ms, angle < ~29 deg, sufficient peak velocity
           if (
             elapsedMs >= COMMIT_MIN_WINDOW_MS &&
             elapsedMs <= COMMIT_MAX_WINDOW_MS &&
-            absDx >= COMMIT_MIN_DX &&
+            absDx >= minCommitDx &&
             absDy < absDx * MAX_ANGLE_RATIO &&
-            arm.peakSpeed >= COMMIT_MIN_PEAK_SPEED
+            arm.peakSpeed >= minCommitSpeed
           ) {
             committedDir = dx > 0 ? 1 : -1;
             this.lockUntilMs = nowMs + RETURN_STROKE_LOCK_MS;

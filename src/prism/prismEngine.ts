@@ -5,6 +5,7 @@ import {
   renderPrismChromaticEdges,
   renderTrailOutline,
 } from '../fx/prism';
+import { RippleWaveSim } from '../fx/ripple';
 import { TransitionManager } from '../fx/transitionManager';
 import type { HandPose2D, Point2D, RenderPolygon } from '../fx/types';
 import type {
@@ -95,13 +96,15 @@ precision highp float;
 in vec2 vScreenUv;
 
 uniform sampler2D uVideo;
-uniform sampler2D uPrevFrame;
+uniform sampler2D uRippleTex;
 uniform vec2 uCoverScale;
 uniform vec2 uVideoTexel;
+uniform vec2 uRippleTexel;
 uniform float uMirrored;
-uniform float uEnhance;
-uniform float uHasPrev;
-uniform int uShaderType; // 0=GLASS, 1=THERMAL, 2=PRISM, 4=CINEMA_CLEAN_PASS1, 5=BLIT_FBO
+uniform float uRippleStrength;
+uniform float uRippleBias;
+uniform float uRippleInvScale;
+uniform int uShaderType; // 0=GLASS, 1=THERMAL, 2=PRISM, 4=PASSTHROUGH_RIPPLE
 uniform vec4 uTint;
 
 out vec4 fragColor;
@@ -116,29 +119,6 @@ float lumaOf(vec3 c) {
   return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
-vec3 rgbToYCbCr(vec3 c) {
-  float y  =  0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
-  float cb = -0.168736 * c.r - 0.331264 * c.g + 0.5 * c.b;
-  float cr =  0.5 * c.r - 0.418688 * c.g - 0.081312 * c.b;
-  return vec3(y, cb, cr);
-}
-
-vec3 yCbCrToRgb(vec3 ycc) {
-  float r = ycc.x + 1.402 * ycc.z;
-  float g = ycc.x - 0.344136 * ycc.y - 0.714136 * ycc.z;
-  float b = ycc.x + 1.772 * ycc.y;
-  return clamp(vec3(r, g, b), 0.0, 1.0);
-}
-
-vec3 acesFilmic(vec3 x) {
-  float a = 2.51;
-  float b = 0.03;
-  float c = 2.43;
-  float d = 0.59;
-  float e = 0.14;
-  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
-}
-
 vec3 thermalFalseColor(float t) {
   vec3 c0 = vec3(0.02, 0.08, 0.42);
   vec3 c1 = vec3(0.45, 0.08, 0.92);
@@ -151,121 +131,49 @@ vec3 thermalFalseColor(float t) {
   return mix(c3, c4, clamp((t - 0.75) / 0.25, 0.0, 1.0));
 }
 
-/**
- * Cinema Clean GPU Pipeline:
- * 1. Motion-Adaptive Temporal Denoise (mix 35% prev frame when diff < 0.08 — zero ghosting)
- * 2. YCbCr Chroma Smoothing (erases red/green low-light blotches while keeping Luma sharp)
- * 3. Edge-Gated CAS Sharpening
- * 4. ACES Filmic Highlight Compression (luma > 0.72) + Cool Shadow Cinema Grade + 0.25 Vignette
- */
-vec3 cinemaCleanPass(vec2 uv, vec2 fboUv) {
-  vec3 c = texture(uVideo, uv).rgb;
-  if (uEnhance <= 0.005) return c;
-
-  vec2 t = uVideoTexel;
-  vec3 n  = texture(uVideo, clamp(uv + vec2( 0.0, -t.y), 0.002, 0.998)).rgb;
-  vec3 s  = texture(uVideo, clamp(uv + vec2( 0.0,  t.y), 0.002, 0.998)).rgb;
-  vec3 e  = texture(uVideo, clamp(uv + vec2( t.x,  0.0), 0.002, 0.998)).rgb;
-  vec3 w  = texture(uVideo, clamp(uv + vec2(-t.x,  0.0), 0.002, 0.998)).rgb;
-  vec3 ne = texture(uVideo, clamp(uv + vec2( t.x, -t.y), 0.002, 0.998)).rgb;
-  vec3 nw = texture(uVideo, clamp(uv + vec2(-t.x, -t.y), 0.002, 0.998)).rgb;
-  vec3 se = texture(uVideo, clamp(uv + vec2( t.x,  t.y), 0.002, 0.998)).rgb;
-  vec3 sw = texture(uVideo, clamp(uv + vec2(-t.x,  t.y), 0.002, 0.998)).rgb;
-
-  float lc = lumaOf(c);
-  float shadowMask = 1.0 - smoothstep(0.08, 0.50, lc);
-
-  // 1. Spatial 3x3 Bilateral Denoise + Separate Chroma (Cb/Cr) Smoothing
-  float sigmaLuma = mix(0.04, 0.12, shadowMask);
-  float inv2SigmaL = 1.0 / (2.0 * sigmaLuma * sigmaLuma);
-  float inv2SigmaC = 1.0 / (2.0 * 0.19 * 0.19); // wider chroma filter wipes color noise on skin/walls
-
-  vec3 yccC = rgbToYCbCr(c);
-  float yAcc = yccC.x;
-  float yW = 1.0;
-  vec2 cbcrAcc = yccC.yz;
-  float cW = 1.0;
-
-  vec3 nbrs[8];
-  nbrs[0] = n; nbrs[1] = s; nbrs[2] = e; nbrs[3] = w;
-  nbrs[4] = ne; nbrs[5] = nw; nbrs[6] = se; nbrs[7] = sw;
-
-  for (int i = 0; i < 8; i++) {
-    vec3 nb = nbrs[i];
-    vec3 yccN = rgbToYCbCr(nb);
-    float spW = (i < 4) ? 0.85 : 0.6;
-    float dy = yccN.x - yccC.x;
-    float wl = exp(-(dy * dy) * inv2SigmaL) * spW;
-    yAcc += yccN.x * wl;
-    yW += wl;
-
-    vec3 diffRgb = nb - c;
-    float wc = exp(-dot(diffRgb, diffRgb) * inv2SigmaC) * spW;
-    cbcrAcc += yccN.yz * wc;
-    cW += wc;
-  }
-
-  float denoisedY = yAcc / yW;
-  vec2 smoothCbCr = cbcrAcc / cW;
-
-  // 2. Edge-Gated CAS Sharpening on Luma channel ONLY (preserves crisp eyes/hair without chroma noise)
-  float minY = min(min(min(lumaOf(n), lumaOf(s)), min(lumaOf(e), lumaOf(w))), denoisedY);
-  float maxY = max(max(max(lumaOf(n), lumaOf(s)), max(lumaOf(e), lumaOf(w))), denoisedY);
-  float edgeGate = smoothstep(0.04, 0.18, maxY - minY) * (1.0 - shadowMask * 0.6);
-  float crossY = (lumaOf(n) + lumaOf(s) + lumaOf(e) + lumaOf(w)) * 0.25;
-  float sharpY = clamp(denoisedY + (denoisedY - crossY) * (0.65 * edgeGate), 0.0, 1.0);
-
-  vec3 clean = yCbCrToRgb(vec3(sharpY, smoothCbCr));
-
-  // 3. Motion-Adaptive Temporal Denoise (35% prev frame blend where diff < 0.08)
-  if (uHasPrev > 0.5) {
-    vec3 prev = texture(uPrevFrame, fboUv).rgb;
-    float diff = length(clean - prev);
-    float temporalWeight = 0.35 * (1.0 - smoothstep(0.025, 0.08, diff));
-    clean = mix(clean, prev, temporalWeight);
-  }
-
-  // 4. ACES Filmic Highlight Compression (luma > 0.72) + Cinema Grade + Soft Vignette (0.25)
-  float lum = lumaOf(clean);
-  if (lum > 0.72) {
-    vec3 filmic = acesFilmic(clean * 1.15);
-    float hiBlend = smoothstep(0.72, 0.98, lum);
-    clean = mix(clean, filmic, hiBlend * 0.78);
-  }
-
-  // Subtle cool-slate deep shadows & natural skin midtones
-  vec3 coolShadow = vec3(0.95, 0.98, 1.04);
-  clean *= mix(vec3(1.0), coolShadow, shadowMask * 0.35);
-  clean = clamp((clean - 0.02) * 1.04, 0.0, 1.0);
-
-  // Soft radial vignette (0.25)
-  vec2 vig = vScreenUv - 0.5;
-  float vigFactor = 1.0 - dot(vig, vig) * 0.92;
-  clean *= mix(1.0, clamp(vigFactor, 0.75, 1.0), 0.95);
-
-  return mix(c, clamp(clean, 0.0, 1.0), clamp(uEnhance, 0.0, 1.0));
+float sampleWaveHeight(vec2 rUv) {
+  return (texture(uRippleTex, clamp(rUv, 0.002, 0.998)).r - uRippleBias) * uRippleInvScale;
 }
 
 void main() {
-  if (uShaderType == 5) {
-    // Pass 2: Fast blit of Cinema Clean FBO
-    vec2 fboUv = vec2(vScreenUv.x, 1.0 - vScreenUv.y);
-    fragColor = vec4(texture(uPrevFrame, fboUv).rgb, 1.0);
-    return;
-  }
-
   vec2 uv = clamp(screenToVideoUv(vScreenUv), vec2(0.002), vec2(0.998));
 
   if (uShaderType == 4) {
-    // Pass 1: Cinema Clean into FBO
-    vec2 fboUv = vec2(vScreenUv.x, 1.0 - vScreenUv.y);
-    fragColor = vec4(cinemaCleanPass(uv, fboUv), 1.0);
+    // Ultra-light pass-through webcam + Liquid Glass Reality Ripple displacement
+    if (uRippleStrength > 0.002) {
+      vec2 rUv = vec2(vScreenUv.x, 1.0 - vScreenUv.y);
+      float hL = sampleWaveHeight(rUv - vec2(uRippleTexel.x, 0.0));
+      float hR = sampleWaveHeight(rUv + vec2(uRippleTexel.x, 0.0));
+      float hU = sampleWaveHeight(rUv - vec2(0.0, uRippleTexel.y));
+      float hD = sampleWaveHeight(rUv + vec2(0.0, uRippleTexel.y));
+
+      vec2 grad = vec2(hR - hL, hD - hU);
+      vec2 disp = grad * 0.095 * uRippleStrength;
+      if (uMirrored > 0.5) disp.x = -disp.x;
+
+      // Liquid Glass Chromatic Aberration (R/G/B split along wave slope)
+      float rCh = texture(uVideo, clamp(uv + disp * 1.14, 0.002, 0.998)).r;
+      float gCh = texture(uVideo, clamp(uv + disp,        0.002, 0.998)).g;
+      float bCh = texture(uVideo, clamp(uv + disp * 0.86, 0.002, 0.998)).b;
+      vec3 refracted = vec3(rCh, gCh, bCh);
+
+      // Crisp specular highlight on liquid wave crests
+      vec3 N = normalize(vec3(-grad.x * 8.5, -grad.y * 8.5, 1.0));
+      vec3 L = normalize(vec3(-0.35, 0.45, 0.82));
+      vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));
+      float spec = pow(max(dot(N, H), 0.0), 40.0) * 0.62 * uRippleStrength;
+      float rimTint = clamp(length(grad) * 2.2, 0.0, 1.0) * 0.14 * uRippleStrength;
+
+      fragColor = vec4(clamp(refracted + vec3(0.85, 0.95, 1.0) * spec + vec3(0.35, 0.72, 1.0) * rimTint, 0.0, 1.0), 1.0);
+      return;
+    }
+
+    fragColor = vec4(texture(uVideo, uv).rgb, 1.0);
     return;
   }
 
-  // Optical Polygons read cleanly from the already Cinema-Clean FBO texture
-  vec2 fboUv = vec2(vScreenUv.x, 1.0 - vScreenUv.y);
-  vec3 cam = texture(uPrevFrame, fboUv).rgb;
+  // Optical Polygons read directly from raw mirrored webcam texture
+  vec3 cam = texture(uVideo, uv).rgb;
   float luma = lumaOf(cam);
 
   if (uShaderType == 0) {
@@ -574,14 +482,6 @@ export class OpticalPrismEngine {
   private vbo: WebGLBuffer;
   private videoTex: WebGLTexture;
 
-  // 2-Pass Cinema Clean Ping-Pong FBOs for Motion-Adaptive Temporal Denoise
-  private prevTexs: [WebGLTexture, WebGLTexture];
-  private prevFbos: [WebGLFramebuffer, WebGLFramebuffer];
-  private fboReadIdx: 0 | 1 = 0;
-  private fboW = 0;
-  private fboH = 0;
-  private hasPrevFrame = false;
-
   private interpolator = new FullHandInterpolator();
 
   private reusableHands: HandPose2D[] = [];
@@ -598,6 +498,8 @@ export class OpticalPrismEngine {
   // Modular high-detail graphics engines (src/fx/)
   private cosmosFx: Cosmos3DEngine | null = null;
   private mysticFx = new MysticFx();
+  private rippleSim: RippleWaveSim;
+  private rippleStrength = 0;
 
   private trailBuffer: TrailFrame[] = [];
   private airStrokes: AirStroke[] = [];
@@ -608,17 +510,18 @@ export class OpticalPrismEngine {
   private polyDissolves: PolyDissolveGhost[] = [];
 
   private transitionMgr = new TransitionManager();
-  private smoothEnhance = 1;
   private elapsed = 0;
 
   private locs: {
     uVideo: WebGLUniformLocation | null;
-    uPrevFrame: WebGLUniformLocation | null;
+    uRippleTex: WebGLUniformLocation | null;
     uCoverScale: WebGLUniformLocation | null;
     uVideoTexel: WebGLUniformLocation | null;
+    uRippleTexel: WebGLUniformLocation | null;
     uMirrored: WebGLUniformLocation | null;
-    uEnhance: WebGLUniformLocation | null;
-    uHasPrev: WebGLUniformLocation | null;
+    uRippleStrength: WebGLUniformLocation | null;
+    uRippleBias: WebGLUniformLocation | null;
+    uRippleInvScale: WebGLUniformLocation | null;
     uShaderType: WebGLUniformLocation | null;
     uTint: WebGLUniformLocation | null;
   };
@@ -639,25 +542,26 @@ export class OpticalPrismEngine {
     this.program = linkProgram(gl, VERT_SRC, FRAG_SRC);
     this.locs = {
       uVideo: gl.getUniformLocation(this.program, 'uVideo'),
-      uPrevFrame: gl.getUniformLocation(this.program, 'uPrevFrame'),
+      uRippleTex: gl.getUniformLocation(this.program, 'uRippleTex'),
       uCoverScale: gl.getUniformLocation(this.program, 'uCoverScale'),
       uVideoTexel: gl.getUniformLocation(this.program, 'uVideoTexel'),
+      uRippleTexel: gl.getUniformLocation(this.program, 'uRippleTexel'),
       uMirrored: gl.getUniformLocation(this.program, 'uMirrored'),
-      uEnhance: gl.getUniformLocation(this.program, 'uEnhance'),
-      uHasPrev: gl.getUniformLocation(this.program, 'uHasPrev'),
+      uRippleStrength: gl.getUniformLocation(this.program, 'uRippleStrength'),
+      uRippleBias: gl.getUniformLocation(this.program, 'uRippleBias'),
+      uRippleInvScale: gl.getUniformLocation(this.program, 'uRippleInvScale'),
       uShaderType: gl.getUniformLocation(this.program, 'uShaderType'),
       uTint: gl.getUniformLocation(this.program, 'uTint'),
     };
 
     const vao = gl.createVertexArray();
     const vbo = gl.createBuffer();
-    if (!vao || !vbo) throw new Error('Không thể khởi tạo tài nguyên WebGL2.');
+    if (!vao || !vbo) throw new Error('Failed to initialize WebGL2 buffers.');
 
     this.vao = vao;
     this.vbo = vbo;
     this.videoTex = this.createLinearTex();
-    this.prevTexs = [this.createLinearTex(), this.createLinearTex()];
-    this.prevFbos = [this.createFbo(this.prevTexs[0]), this.createFbo(this.prevTexs[1])];
+    this.rippleSim = new RippleWaveSim(gl);
 
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
@@ -682,14 +586,12 @@ export class OpticalPrismEngine {
       new Uint8Array([0, 0, 0, 255]),
     );
     gl.bindTexture(gl.TEXTURE_2D, null);
-
-    this.ensureFboSize(canvas.width || 1280, canvas.height || 720);
   }
 
   private createLinearTex(): WebGLTexture {
     const gl = this.gl;
     const tex = gl.createTexture();
-    if (!tex) throw new Error('Không thể tạo WebGL2 texture.');
+    if (!tex) throw new Error('Failed to create WebGL2 texture.');
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -699,39 +601,14 @@ export class OpticalPrismEngine {
     return tex;
   }
 
-  private createFbo(tex: WebGLTexture): WebGLFramebuffer {
-    const gl = this.gl;
-    const fbo = gl.createFramebuffer();
-    if (!fbo) throw new Error('Không thể tạo WebGL2 framebuffer.');
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    return fbo;
-  }
-
-  private ensureFboSize(w: number, h: number): void {
-    const pw = Math.max(1, Math.floor(w));
-    const ph = Math.max(1, Math.floor(h));
-    if (pw === this.fboW && ph === this.fboH) return;
-    this.fboW = pw;
-    this.fboH = ph;
-    this.hasPrevFrame = false;
-
-    const gl = this.gl;
-    for (let i = 0; i < 2; i += 1) {
-      gl.bindTexture(gl.TEXTURE_2D, this.prevTexs[i]);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, pw, ph, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    }
-    gl.bindTexture(gl.TEXTURE_2D, null);
-  }
-
   resetSmoothing(): void {
     this.interpolator.reset();
     this.cosmosFx?.reset();
     this.cosmosFx?.resetLightning();
+    this.cosmosFx?.resetFluid();
     this.mysticFx.reset();
+    this.rippleSim.clear();
     this.trailBuffer = [];
-    this.hasPrevFrame = false;
   }
 
   isCosmosBlackHoleBusy(): boolean {
@@ -1100,7 +977,6 @@ export class OpticalPrismEngine {
     swipeIndicator?: SwipeIndicatorState,
   ): FrameOutput {
     this.elapsed += dt;
-    this.ensureFboSize(viewW, viewH);
     this.cosmosFx?.setLightningSfxEnabled(settings.sfxEnabled);
 
     const gl = this.gl;
@@ -1150,6 +1026,7 @@ export class OpticalPrismEngine {
       if (targetMode === 'COSMOS') this.cosmosFx?.reset();
       if (targetMode === 'MYSTIC') this.mysticFx.reset();
       if (targetMode === 'LIGHTNING') this.cosmosFx?.resetLightning();
+      if (targetMode === 'FLUID') this.cosmosFx?.resetFluid();
     }
     const trans = this.transitionMgr.update(dt);
     const activeMode = trans.activeMode;
@@ -1215,54 +1092,56 @@ export class OpticalPrismEngine {
       this.trailBuffer.shift();
     }
 
-    const targetEnhance = settings.hdDenoise ? 1.0 : 0.0;
-    this.smoothEnhance += (targetEnhance - this.smoothEnhance) * (1 - Math.exp(-5.0 * dt));
+    // Smooth Reality Ripple wave simulation + 250ms flatten decay when leaving RIPPLE
+    const isRippleTarget = !settings.airDrawEnabled && activeMode === 'RIPPLE';
+    if (isRippleTarget) {
+      this.rippleStrength = Math.min(1, this.rippleStrength + dt * 6.5);
+    } else if (this.rippleStrength > 0) {
+      this.rippleStrength = Math.max(0, this.rippleStrength - dt / 0.25);
+      if (this.rippleStrength === 0) {
+        this.rippleSim.clear();
+      }
+    }
 
-    const writeIdx: 0 | 1 = this.fboReadIdx === 0 ? 1 : 0;
+    if (this.rippleStrength > 0.002) {
+      this.rippleSim.step(isRippleTarget ? hands : [], dt, viewW, viewH);
+    }
 
-    // --- WebGL2 Pass 1: Cinema Clean (Temporal Denoise + Chroma Smooth + ACES + Vignette) into FBO ---
+    // --- Single-Pass WebGL2 Webcam Pass-Through (+ Liquid Glass Ripple) + Optical Polygons ---
     gl.useProgram(this.program);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.prevFbos[writeIdx]);
-    gl.viewport(0, 0, this.fboW, this.fboH);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, viewW, viewH);
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
     gl.uniform1i(this.locs.uVideo, 0);
 
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.prevTexs[this.fboReadIdx]);
-    gl.uniform1i(this.locs.uPrevFrame, 1);
+    gl.bindTexture(gl.TEXTURE_2D, this.rippleSim.getHeightTexture());
+    gl.uniform1i(this.locs.uRippleTex, 1);
+
+    const [rBias, rInvScale] = this.rippleSim.getBiasAndInvScale();
+    const [rTexX, rTexY] = this.rippleSim.getTexelSize();
 
     gl.uniform2f(this.locs.uCoverScale, coverX, coverY);
     gl.uniform2f(this.locs.uVideoTexel, 1.0 / Math.max(videoW, 1), 1.0 / Math.max(videoH, 1));
+    gl.uniform2f(this.locs.uRippleTexel, rTexX, rTexY);
     gl.uniform1f(this.locs.uMirrored, settings.mirrored ? 1.0 : 0.0);
-    gl.uniform1f(this.locs.uEnhance, this.smoothEnhance);
-    gl.uniform1f(this.locs.uHasPrev, this.hasPrevFrame ? 1.0 : 0.0);
+    gl.uniform1f(this.locs.uRippleStrength, this.rippleStrength);
+    gl.uniform1f(this.locs.uRippleBias, rBias);
+    gl.uniform1f(this.locs.uRippleInvScale, rInvScale);
 
     this.drawFullQuad(4);
-
-    // --- WebGL2 Pass 2: Blit Cinema Clean FBO + Optical Polygons ---
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, viewW, viewH);
-
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.prevTexs[writeIdx]);
-    gl.uniform1i(this.locs.uPrevFrame, 1);
-
-    this.drawFullQuad(5);
 
     for (let i = 0; i < livePolygons.length; i += 1) {
       this.drawPolygonWebGL(livePolygons[i], viewW, viewH);
     }
 
-    // Unbind both texture units cleanly (ANGLE D3D11 zero feedback hazard)
+    // Unbind both texture units cleanly
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, null);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, null);
-
-    this.fboReadIdx = writeIdx;
-    this.hasPrevFrame = true;
 
     // --- Canvas 2D & Shared Three.js WebGL2 + UnrealBloomPass Overlay ---
     if (overlayCtx) {
@@ -1337,7 +1216,7 @@ export class OpticalPrismEngine {
       this.drawPolyDissolves(overlayCtx, dt);
 
       if (!settings.airDrawEnabled) {
-        // Shared Three.js Stage renders Cosmos AND/OR 3D Volumetric Lightning in ONE UnrealBloomPass
+        // Shared Three.js Stage renders Cosmos, 3D Volumetric Lightning, AND 8,000-Particle Fluid in ONE UnrealBloomPass
         const cosmosActive =
           activeMode === 'COSMOS' || (trans.outgoingMode === 'COSMOS' && trans.outgoingAlpha > 0.02);
         const cosmosFade =
@@ -1350,13 +1229,21 @@ export class OpticalPrismEngine {
           activeMode === 'LIGHTNING' ? trans.activeAlpha : trans.outgoingAlpha;
         const lightningEnter = activeMode === 'LIGHTNING' ? trans.enterProgress : 1;
 
-        if (cosmosActive || lightningActive) {
+        const fluidActive =
+          activeMode === 'FLUID' ||
+          (trans.outgoingMode === 'FLUID' && trans.outgoingAlpha > 0.02);
+        const fluidFade =
+          activeMode === 'FLUID' ? trans.activeAlpha : trans.outgoingAlpha;
+
+        if (cosmosActive || lightningActive || fluidActive) {
           this.cosmosFx?.renderStage({
             cosmosActive,
             cosmosFade,
             lightningActive,
             lightningFade,
             lightningEnter,
+            fluidActive,
+            fluidFade,
             hands,
             dt,
             viewW,
@@ -1401,12 +1288,11 @@ export class OpticalPrismEngine {
   dispose(): void {
     this.cosmosFx?.dispose();
     this.cosmosFx = null;
+    this.rippleSim.dispose();
     const gl = this.gl;
     gl.deleteProgram(this.program);
     gl.deleteVertexArray(this.vao);
     gl.deleteBuffer(this.vbo);
     gl.deleteTexture(this.videoTex);
-    this.prevTexs.forEach((t) => gl.deleteTexture(t));
-    this.prevFbos.forEach((f) => gl.deleteFramebuffer(f));
   }
 }

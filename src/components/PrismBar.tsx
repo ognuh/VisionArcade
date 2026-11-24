@@ -10,6 +10,8 @@ import {
   Scan,
   Shield,
   SlidersHorizontal,
+  Sparkles,
+  Waves,
 } from 'lucide-react';
 import { AIR_DRAW_COLORS } from '../prism/prismEngine';
 import type {
@@ -51,6 +53,8 @@ const MODES: { id: PrismModeId; label: string; keyHint: string; icon: typeof Sca
   { id: 'COSMOS', label: 'Cosmos', keyHint: '5', icon: Orbit },
   { id: 'LIGHTNING', label: 'Lightning', keyHint: '6', icon: CloudLightning },
   { id: 'MYSTIC', label: 'Mystic', keyHint: '7', icon: Shield },
+  { id: 'RIPPLE', label: 'Ripple', keyHint: '8', icon: Waves },
+  { id: 'FLUID', label: 'Fluid', keyHint: '9', icon: Sparkles },
 ];
 
 const CAMERA_PRESETS: { id: CameraPresetId; label: string }[] = [
@@ -162,6 +166,8 @@ export function PrismBar({
       else if (e.key === '5') onSettingsChange({ mode: 'COSMOS', airDrawEnabled: false });
       else if (e.key === '6') onSettingsChange({ mode: 'LIGHTNING', airDrawEnabled: false });
       else if (e.key === '7') onSettingsChange({ mode: 'MYSTIC', airDrawEnabled: false });
+      else if (e.key === '8') onSettingsChange({ mode: 'RIPPLE', airDrawEnabled: false });
+      else if (e.key === '9') onSettingsChange({ mode: 'FLUID', airDrawEnabled: false });
       else if (e.key === 'ArrowRight') {
         e.preventDefault();
         onStepMode(1);
@@ -172,8 +178,6 @@ export function PrismBar({
         onSettingsChange({ trailEnabled: !settings.trailEnabled });
       } else if (e.key === 'd' || e.key === 'D') {
         onSettingsChange({ airDrawEnabled: !settings.airDrawEnabled });
-      } else if (e.key === 'h' || e.key === 'H') {
-        onSettingsChange({ hdDenoise: !settings.hdDenoise });
       } else if (e.key === 'u' || e.key === 'U') {
         onSettingsChange({ cyberHud: !settings.cyberHud });
       } else if (e.key === 'm' || e.key === 'M') {
@@ -192,7 +196,6 @@ export function PrismBar({
     onToggleTools,
     settings.airDrawEnabled,
     settings.cyberHud,
-    settings.hdDenoise,
     settings.mirrored,
     settings.noteOpen,
     settings.trailEnabled,
@@ -348,11 +351,6 @@ export function PrismBar({
                 label="Air Draw"
                 checked={settings.airDrawEnabled}
                 onToggle={() => onSettingsChange({ airDrawEnabled: !settings.airDrawEnabled })}
-              />
-              <StudioToggleRow
-                label="Cinema Denoise"
-                checked={settings.hdDenoise}
-                onToggle={() => onSettingsChange({ hdDenoise: !settings.hdDenoise })}
               />
               <StudioToggleRow
                 label="Cyber HUD"

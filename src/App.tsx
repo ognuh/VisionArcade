@@ -97,6 +97,8 @@ const MODE_DISPLAY_NAME: Record<CycleModeId, string> = {
   COSMOS: 'COSMOS',
   LIGHTNING: 'LIGHTNING',
   MYSTIC: 'MYSTIC',
+  RIPPLE: 'RIPPLE',
+  FLUID: 'FLUID',
 };
 
 function purgeLegacyStorage(): void {
@@ -154,7 +156,6 @@ function createInitialSettings(): PrismSettings {
     trailEnabled: false,
     airDrawEnabled: false,
     drawColor: 'CYAN',
-    hdDenoise: true,
     cyberHud: true,
     noteOpen: false,
     sfxEnabled: loadSavedSfxEnabled(),

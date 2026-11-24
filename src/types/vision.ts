@@ -22,7 +22,9 @@ export type PrismModeId =
   | 'PRISM'
   | 'COSMOS'
   | 'LIGHTNING'
-  | 'MYSTIC';
+  | 'MYSTIC'
+  | 'RIPPLE'
+  | 'FLUID';
 
 export type CycleModeId = Exclude<PrismModeId, 'AUTO'>;
 
@@ -33,6 +35,8 @@ export const MODE_CYCLE_ORDER: readonly CycleModeId[] = [
   'COSMOS',
   'LIGHTNING',
   'MYSTIC',
+  'RIPPLE',
+  'FLUID',
 ];
 
 export type AirDrawColorId = 'CYAN' | 'MAGENTA' | 'GREEN' | 'GOLD';
@@ -50,7 +54,6 @@ export interface PrismSettings {
   trailEnabled: boolean;
   airDrawEnabled: boolean;
   drawColor: AirDrawColorId;
-  hdDenoise: boolean;
   cyberHud: boolean;
   noteOpen: boolean;
   sfxEnabled: boolean;

@@ -12,6 +12,8 @@ export type MockPoseId =
   | 'AIR_SWIPE_LEFT'
   | 'AIR_SWIPE_RETURN'
   | 'DOCK_HOVER_CENTER'
+  | 'RIPPLE_WAVE_BURST'
+  | 'FLUID_INTERACT'
   | 'HAND_BLINK'
   | 'FIST_BOTH';
 
@@ -213,6 +215,89 @@ export function generateMockHands(pose: MockPoseId, elapsedSec: number): Landmar
         1.07,
         0.15,
         { thumb: false, index: true, middle: false, ring: false, pinky: false },
+        1,
+      ),
+    ];
+  }
+
+  if (pose === 'RIPPLE_WAVE_BURST') {
+    // 0..0.7s smooth hand sweep creating liquid wake -> 0.7..0.95s tight Fist -> 0.95s+ Open Shockwave Burst!
+    if (elapsedSec < 0.7) {
+      const t = elapsedSec / 0.7;
+      const cx = 0.25 + t * 0.50;
+      const cy = 0.48 + Math.sin(t * Math.PI * 2) * 0.14;
+      return [
+        buildMockHand(
+          cx,
+          cy,
+          0.15,
+          { thumb: true, index: true, middle: false, ring: false, pinky: false },
+          1,
+        ),
+      ];
+    }
+    if (elapsedSec < 0.95) {
+      return [
+        buildMockHand(
+          0.5,
+          0.5,
+          0.15,
+          { thumb: false, index: false, middle: false, ring: false, pinky: false },
+          1,
+        ),
+      ];
+    }
+    return [
+      buildMockHand(
+        0.5,
+        0.5,
+        0.16,
+        { thumb: true, index: true, middle: true, ring: true, pinky: true },
+        1,
+      ),
+    ];
+  }
+
+  if (pose === 'FLUID_INTERACT') {
+    // 0..0.55s gentle 2-hand sweep -> 0.55..1.35s Pinch Vortex (thumb 4 & index 8 touching) -> 1.35s+ Open Supernova Burst!
+    if (elapsedSec < 0.55) {
+      const t = elapsedSec / 0.55;
+      return [
+        buildMockHand(
+          0.25 + t * 0.22,
+          0.52 + Math.sin(t * Math.PI) * 0.1,
+          0.15,
+          { thumb: false, index: true, middle: true, ring: false, pinky: false },
+          1,
+        ),
+        buildMockHand(
+          0.75 - t * 0.22,
+          0.48 - Math.sin(t * Math.PI) * 0.1,
+          0.15,
+          { thumb: false, index: true, middle: true, ring: false, pinky: false },
+          -1,
+        ),
+      ];
+    }
+    if (elapsedSec < 1.35) {
+      const hand = buildMockHand(
+        0.5,
+        0.5,
+        0.15,
+        { thumb: false, index: false, middle: false, ring: false, pinky: false },
+        1,
+      );
+      // Force thumb tip (4) & index tip (8) to pinch tightly together (< 0.015 dist)
+      hand[4] = { x: 0.495, y: 0.46, z: -0.02 };
+      hand[8] = { x: 0.505, y: 0.46, z: -0.02 };
+      return [hand];
+    }
+    return [
+      buildMockHand(
+        0.5,
+        0.5,
+        0.16,
+        { thumb: true, index: true, middle: true, ring: true, pinky: true },
         1,
       ),
     ];
