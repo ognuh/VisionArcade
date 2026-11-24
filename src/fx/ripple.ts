@@ -3,13 +3,13 @@ import type { HandPose2D } from './types';
 
 const ULTRA_SIM_W = 512;
 const ULTRA_SIM_H = 288;
-const HIGH_SIM_W = 384;
-const HIGH_SIM_H = 216;
+const PRO_SIM_W = 320;
+const PRO_SIM_H = 180;
 
 const MAX_IMPULSES = 48;
 const MAX_RINGS = 2;
 const FIXED_STEP_SEC = 1 / 120; // 120Hz fixed physics timestep — immune to 60/120/144Hz FPS jitter
-const DAMPING_120HZ = 0.9924; // Ultra silky 16-bit half-float wave persistence
+const DAMPING_120HZ = 0.9932; // Ultra silky 16-bit half-float wave persistence
 const FIST_HOLD_MIN_SEC = 0.12;
 const SHOCKWAVE_COOLDOWN_SEC = 0.7;
 
@@ -374,8 +374,8 @@ export class RippleWaveSim {
   public setQuality(quality: GraphicsQuality): void {
     if (this.quality === quality) return;
     this.quality = quality;
-    const targetW = quality === 'ULTRA' ? ULTRA_SIM_W : HIGH_SIM_W;
-    const targetH = quality === 'ULTRA' ? ULTRA_SIM_H : HIGH_SIM_H;
+    const targetW = quality === 'ULTRA' ? ULTRA_SIM_W : PRO_SIM_W;
+    const targetH = quality === 'ULTRA' ? ULTRA_SIM_H : PRO_SIM_H;
     if (targetW === this.simW && targetH === this.simH) return;
 
     const gl = this.gl;
@@ -475,8 +475,8 @@ export class RippleWaveSim {
       const speed = dist / safeDt;
 
       if (dist > 0.001) {
-        // 6-8 smooth Catmull-Rom sub-steps along trajectory -> unbroken liquid-glass wake at 144Hz
-        const subSteps = Math.min(8, Math.max(6, Math.ceil(dist / 0.007)));
+        // 6 smooth Catmull-Rom sub-steps along trajectory -> unbroken liquid-glass wake at 120Hz
+        const subSteps = 6;
         const amp = Math.min(maxAmp, 0.048 + speed * 0.102) / Math.sqrt(subSteps);
         for (let s = 1; s <= subSteps; s += 1) {
           const f = s / subSteps;

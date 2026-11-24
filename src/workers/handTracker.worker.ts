@@ -1,5 +1,12 @@
 import { FilesetResolver, HandLandmarker, PoseLandmarker } from '@mediapipe/tasks-vision';
-import type { AiEngineMode, GpuInfo, GpuTier, Landmark3D, TrackerTaskMode } from '../types/vision';
+import type {
+  AiEngineMode,
+  GpuInfo,
+  GpuTier,
+  Landmark3D,
+  MaxHandsOption,
+  TrackerTaskMode,
+} from '../types/vision';
 
 const ALLOWED_WASM_LOADERS = new Set([
   '/mediapipe/vision_wasm_module_internal.js',
@@ -29,17 +36,15 @@ const HAND_LANDMARKER_MODEL_URL =
 const POSE_LANDMARKER_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
 
-const AI_W = 320;
-const AI_H = 180;
-const WARMUP_FRAMES = 3;
-const BENCHMARK_FRAMES = 25;
-const GPU_MAX_AVG_INFER_MS = 24;
-const GPU_MIN_AI_FPS = 24;
+// 256x144: 36% fewer pixels than 320x180 -> lower GPU memory pressure & zero readPixels stalls
+const AI_W = 256;
+const AI_H = 144;
 
 interface InitRequest {
   type: 'INIT';
   engineMode?: AiEngineMode;
   taskMode?: TrackerTaskMode;
+  maxHands?: MaxHandsOption;
 }
 
 interface DetectRequest {
@@ -58,6 +63,11 @@ interface SetTaskModeRequest {
   taskMode: TrackerTaskMode;
 }
 
+interface SetMaxHandsRequest {
+  type: 'SET_MAX_HANDS';
+  maxHands: MaxHandsOption;
+}
+
 interface CloseRequest {
   type: 'CLOSE';
 }
@@ -67,6 +77,7 @@ type WorkerRequest =
   | DetectRequest
   | SetEngineRequest
   | SetTaskModeRequest
+  | SetMaxHandsRequest
   | CloseRequest;
 
 type VisionFileset = Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
@@ -74,33 +85,16 @@ type VisionFileset = Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
 let visionFileset: VisionFileset | null = null;
 let handLandmarker: HandLandmarker | null = null;
 let handDelegate: 'GPU' | 'CPU' | null = null;
+let handNumConfigured: MaxHandsOption = 2;
 let poseLandmarker: PoseLandmarker | null = null;
 let poseDelegate: 'GPU' | 'CPU' | null = null;
 
 let engineMode: AiEngineMode = 'GPU';
 let taskMode: TrackerTaskMode = 'HAND';
+let maxHands: MaxHandsOption = 2;
 let activeDelegate: 'GPU' | 'CPU' = 'GPU';
 let isSwitching = false;
 let lastDetectTs = 0;
-
-// Auto-Benchmark state (first 25 steady-state frames after 3 cold warmup frames on GPU)
-let benchDone = false;
-let warmupCount = 0;
-let benchCount = 0;
-let benchInferSumMs = 0;
-let benchStartMs = 0;
-let benchInputSpanSumMs = 0;
-let benchPrevInputTs = 0;
-
-function resetBenchmark(): void {
-  benchDone = false;
-  warmupCount = 0;
-  benchCount = 0;
-  benchInferSumMs = 0;
-  benchStartMs = 0;
-  benchInputSpanSumMs = 0;
-  benchPrevInputTs = 0;
-}
 
 function classifyGpuTier(renderer: string): GpuTier {
   const lower = renderer.toLowerCase();
@@ -131,13 +125,12 @@ function classifyGpuTier(renderer: string): GpuTier {
   return 'UNKNOWN';
 }
 
-function detectWorkerGpu(): { renderer: string; tier: GpuTier } {
+function detectWorkerGpu(): { renderer: string; tier: GpuTier; hasWebGl2: boolean } {
   try {
     const c = new OffscreenCanvas(16, 16);
-    const gl =
-      c.getContext('webgl2', { powerPreference: 'high-performance' }) ||
-      c.getContext('webgl', { powerPreference: 'high-performance' });
-    if (!gl) return { renderer: 'Worker CPU', tier: 'SOFTWARE' };
+    const gl2 = c.getContext('webgl2', { powerPreference: 'high-performance' });
+    const gl = gl2 || c.getContext('webgl', { powerPreference: 'high-performance' });
+    if (!gl) return { renderer: 'No Worker WebGL', tier: 'SOFTWARE', hasWebGl2: false };
     const ext = gl.getExtension('WEBGL_debug_renderer_info');
     const raw = ext
       ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) ?? '')
@@ -148,158 +141,157 @@ function detectWorkerGpu(): { renderer: string; tier: GpuTier } {
       .replace(/\s*Direct3D11.*$/i, '')
       .replace(/\)\s*$/, '')
       .trim();
-    return { renderer: cleaned || raw || 'WebGL GPU', tier: classifyGpuTier(raw) };
+    return { renderer: cleaned || raw || 'WebGL GPU', tier: classifyGpuTier(raw), hasWebGl2: Boolean(gl2) };
   } catch {
-    return { renderer: 'Worker CPU', tier: 'SOFTWARE' };
+    return { renderer: 'No Worker WebGL', tier: 'SOFTWARE', hasWebGl2: false };
   }
 }
 
 async function createHandLandmarker(
   vision: VisionFileset,
   delegate: 'GPU' | 'CPU',
+  numHands: MaxHandsOption,
 ): Promise<HandLandmarker> {
+  const opts = {
+    baseOptions: {
+      modelAssetPath: HAND_LANDMARKER_MODEL_URL,
+      delegate,
+    },
+    runningMode: 'VIDEO' as const,
+    numHands,
+    minHandDetectionConfidence: 0.55,
+    minHandPresenceConfidence: 0.50,
+    minTrackingConfidence: 0.45,
+  };
+
   if (delegate === 'GPU') {
     const glHost = new OffscreenCanvas(AI_W, AI_H);
     return HandLandmarker.createFromOptions(vision, {
       canvas: glHost as unknown as HTMLCanvasElement,
-      baseOptions: {
-        modelAssetPath: HAND_LANDMARKER_MODEL_URL,
-        delegate: 'GPU',
-      },
-      runningMode: 'VIDEO',
-      numHands: 2,
-      minHandDetectionConfidence: 0.35,
-      minHandPresenceConfidence: 0.35,
-      minTrackingConfidence: 0.4,
+      ...opts,
     });
   }
-
-  return HandLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath: HAND_LANDMARKER_MODEL_URL,
-      delegate: 'CPU',
-    },
-    runningMode: 'VIDEO',
-    numHands: 2,
-    minHandDetectionConfidence: 0.35,
-    minHandPresenceConfidence: 0.35,
-    minTrackingConfidence: 0.4,
-  });
+  return HandLandmarker.createFromOptions(vision, opts);
 }
 
 async function createPoseLandmarker(
   vision: VisionFileset,
   delegate: 'GPU' | 'CPU',
 ): Promise<PoseLandmarker> {
+  const opts = {
+    baseOptions: {
+      modelAssetPath: POSE_LANDMARKER_MODEL_URL,
+      delegate,
+    },
+    runningMode: 'VIDEO' as const,
+    numPoses: 1,
+    minPoseDetectionConfidence: 0.50,
+    minPosePresenceConfidence: 0.50,
+    minTrackingConfidence: 0.45,
+  };
+
   if (delegate === 'GPU') {
     const glHost = new OffscreenCanvas(AI_W, AI_H);
     return PoseLandmarker.createFromOptions(vision, {
       canvas: glHost as unknown as HTMLCanvasElement,
-      baseOptions: {
-        modelAssetPath: POSE_LANDMARKER_MODEL_URL,
-        delegate: 'GPU',
-      },
-      runningMode: 'VIDEO',
-      numPoses: 1,
-      minPoseDetectionConfidence: 0.45,
-      minPosePresenceConfidence: 0.45,
-      minTrackingConfidence: 0.45,
-      outputSegmentationMasks: false,
+      ...opts,
     });
   }
-
-  return PoseLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath: POSE_LANDMARKER_MODEL_URL,
-      delegate: 'CPU',
-    },
-    runningMode: 'VIDEO',
-    numPoses: 1,
-    minPoseDetectionConfidence: 0.45,
-    minPosePresenceConfidence: 0.45,
-    minTrackingConfidence: 0.45,
-    outputSegmentationMasks: false,
-  });
+  return PoseLandmarker.createFromOptions(vision, opts);
 }
 
-/** Ensures ONLY the active landmarker (HAND or POSE) is ready with the requested delegate. */
-async function ensureActiveModel(
-  desiredTask: TrackerTaskMode,
-  desiredDelegate: 'GPU' | 'CPU',
-): Promise<'GPU' | 'CPU'> {
-  if (!visionFileset) return desiredDelegate;
-
-  if (desiredTask === 'HAND') {
-    if (handLandmarker && handDelegate === desiredDelegate) return desiredDelegate;
-    const old = handLandmarker;
+function closeHandModel(): void {
+  if (handLandmarker) {
+    try {
+      handLandmarker.close();
+    } catch {
+      // ignore
+    }
     handLandmarker = null;
     handDelegate = null;
-    old?.close();
-
-    try {
-      handLandmarker = await createHandLandmarker(visionFileset, desiredDelegate);
-      handDelegate = desiredDelegate;
-      return desiredDelegate;
-    } catch {
-      handLandmarker = await createHandLandmarker(visionFileset, 'CPU');
-      handDelegate = 'CPU';
-      return 'CPU';
-    }
-  } else {
-    if (poseLandmarker && poseDelegate === desiredDelegate) return desiredDelegate;
-    const old = poseLandmarker;
-    poseLandmarker = null;
-    poseDelegate = null;
-    old?.close();
-
-    try {
-      poseLandmarker = await createPoseLandmarker(visionFileset, desiredDelegate);
-      poseDelegate = desiredDelegate;
-      return desiredDelegate;
-    } catch {
-      poseLandmarker = await createPoseLandmarker(visionFileset, 'CPU');
-      poseDelegate = 'CPU';
-      return 'CPU';
-    }
   }
 }
 
-async function hotSwitch(
+function closePoseModel(): void {
+  if (poseLandmarker) {
+    try {
+      poseLandmarker.close();
+    } catch {
+      // ignore
+    }
+    poseLandmarker = null;
+    poseDelegate = null;
+  }
+}
+
+/**
+ * Ensures ONLY the active model (HAND or POSE) is loaded with the exact requested delegate.
+ * Strictly NEVER downgrades GPU -> CPU silently; throws if GPU fails so client can try Main-Thread GPU.
+ */
+async function ensureActiveModel(
   targetTask: TrackerTaskMode,
   targetDelegate: 'GPU' | 'CPU',
-  reason: string,
-  avgInferMs = 0,
+  targetMaxHands: MaxHandsOption,
 ): Promise<void> {
-  if (isSwitching || !visionFileset) return;
+  if (!visionFileset) throw new Error('MediaPipe FilesetResolver not initialized');
+
+  if (targetTask === 'POSE') {
+    if (poseLandmarker && poseDelegate === targetDelegate) return;
+    closePoseModel();
+    poseLandmarker = await createPoseLandmarker(visionFileset, targetDelegate);
+    poseDelegate = targetDelegate;
+    return;
+  }
+
+  if (handLandmarker && handDelegate === targetDelegate && handNumConfigured === targetMaxHands) {
+    return;
+  }
+  closeHandModel();
+  handLandmarker = await createHandLandmarker(visionFileset, targetDelegate, targetMaxHands);
+  handDelegate = targetDelegate;
+  handNumConfigured = targetMaxHands;
+}
+
+async function reconfigure(
+  nextTask: TrackerTaskMode,
+  nextDelegate: 'GPU' | 'CPU',
+  nextMaxHands: MaxHandsOption,
+): Promise<void> {
+  if (!visionFileset || isSwitching) return;
   isSwitching = true;
   try {
-    taskMode = targetTask;
-    const actual = await ensureActiveModel(targetTask, targetDelegate);
-    const delegateChanged = actual !== activeDelegate;
-    activeDelegate = actual;
-
-    if (delegateChanged || reason === 'manual' || reason === 'auto-benchmark') {
-      self.postMessage({
-        type: 'DELEGATE_CHANGED',
-        delegate: activeDelegate,
-        taskMode,
-        reason,
-        avgInferMs: Math.round(avgInferMs * 10) / 10,
-      });
-    }
+    await ensureActiveModel(nextTask, nextDelegate, nextMaxHands);
+    taskMode = nextTask;
+    activeDelegate = nextDelegate;
+    maxHands = nextMaxHands;
+    lastDetectTs = 0;
+    self.postMessage({
+      type: 'DELEGATE_CHANGED',
+      delegate: activeDelegate,
+      taskMode,
+      maxHands,
+    });
+  } catch (err) {
+    self.postMessage({
+      type: 'GPU_UNAVAILABLE',
+      message: err instanceof Error ? err.message : 'Worker GPU delegate failed',
+    });
   } finally {
     isSwitching = false;
   }
 }
 
-async function initTracker(initialMode: AiEngineMode, initialTask: TrackerTaskMode): Promise<void> {
+async function initTracker(
+  initialMode: AiEngineMode,
+  initialTask: TrackerTaskMode,
+  initialMaxHands: MaxHandsOption,
+): Promise<void> {
   engineMode = initialMode;
   taskMode = initialTask;
-  resetBenchmark();
+  maxHands = initialMaxHands;
 
   try {
     const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_ROOT);
-    // Use MediaPipe's official ES Module WASM loader in ES Module Workers (sets globalThis.ModuleFactory natively, zero eval)
     if (vision.wasmLoaderPath.endsWith('/vision_wasm_internal.js')) {
       vision.wasmLoaderPath = `${MEDIAPIPE_WASM_ROOT}/vision_wasm_module_internal.js`;
       vision.wasmBinaryPath = `${MEDIAPIPE_WASM_ROOT}/vision_wasm_module_internal.wasm`;
@@ -307,31 +299,43 @@ async function initTracker(initialMode: AiEngineMode, initialTask: TrackerTaskMo
     visionFileset = vision;
     const gpu = detectWorkerGpu();
 
-    const wantDelegate: 'GPU' | 'CPU' = initialMode === 'CPU' ? 'CPU' : 'GPU';
-    const actual = await ensureActiveModel(initialTask, wantDelegate);
-    activeDelegate = actual;
-    if (actual === 'CPU') benchDone = true;
+    // If user requested GPU and Worker OffscreenCanvas lacks WebGL2, inform client to try Main-Thread GPU
+    if (initialMode === 'GPU' && !gpu.hasWebGl2) {
+      self.postMessage({
+        type: 'GPU_UNAVAILABLE',
+        message: 'Worker OffscreenCanvas WebGL2 unavailable',
+      });
+      return;
+    }
+
+    await ensureActiveModel(initialTask, initialMode, initialMaxHands);
+    activeDelegate = initialMode;
 
     const gpuInfo: GpuInfo =
-      actual === 'GPU'
+      activeDelegate === 'GPU'
         ? { delegate: 'GPU', renderer: `${gpu.renderer} (Worker)`, tier: gpu.tier }
         : { delegate: 'CPU', renderer: 'Worker WASM SIMD', tier: 'SOFTWARE' };
 
     self.postMessage({ type: 'READY', gpuInfo, delegate: activeDelegate, taskMode });
   } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Worker MediaPipe init failed';
     self.postMessage({
-      type: 'ERROR',
-      message: err instanceof Error ? err.message : 'Worker MediaPipe init failed',
+      type: initialMode === 'GPU' ? 'GPU_UNAVAILABLE' : 'ERROR',
+      message: msg,
     });
   }
 }
 
 function sanitizeEngineMode(mode: unknown): AiEngineMode {
-  return mode === 'GPU' || mode === 'CPU' || mode === 'AUTO' ? mode : 'GPU';
+  return mode === 'CPU' ? 'CPU' : 'GPU';
 }
 
 function sanitizeTaskMode(mode: unknown): TrackerTaskMode {
   return mode === 'POSE' ? 'POSE' : 'HAND';
+}
+
+function sanitizeMaxHands(val: unknown): MaxHandsOption {
+  return val === 1 ? 1 : 2;
 }
 
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
@@ -339,54 +343,54 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   if (!msg || typeof msg !== 'object') return;
 
   if (msg.type === 'INIT') {
-    void initTracker(sanitizeEngineMode(msg.engineMode), sanitizeTaskMode(msg.taskMode));
+    void initTracker(
+      sanitizeEngineMode(msg.engineMode),
+      sanitizeTaskMode(msg.taskMode),
+      sanitizeMaxHands(msg.maxHands),
+    );
     return;
   }
 
   if (msg.type === 'SET_ENGINE') {
-    engineMode = sanitizeEngineMode(msg.engineMode);
-    resetBenchmark();
-    if (engineMode === 'CPU') {
-      benchDone = true;
-      void hotSwitch(taskMode, 'CPU', 'manual');
-    } else if (engineMode === 'GPU') {
-      benchDone = true;
-      void hotSwitch(taskMode, 'GPU', 'manual');
-    } else {
-      void hotSwitch(taskMode, 'GPU', 'auto-rebenchmark');
-    }
+    const nextEngine = sanitizeEngineMode(msg.engineMode);
+    if (nextEngine === engineMode && nextEngine === activeDelegate) return;
+    engineMode = nextEngine;
+    void reconfigure(taskMode, nextEngine, maxHands);
     return;
   }
 
   if (msg.type === 'SET_TASK_MODE') {
     const nextTask = sanitizeTaskMode(msg.taskMode);
     if (nextTask === taskMode) return;
-    taskMode = nextTask;
-    // Mutually exclusive: only run & ensure the requested model (HAND or POSE)
-    void hotSwitch(nextTask, activeDelegate, 'task-switch');
+    void reconfigure(nextTask, activeDelegate, maxHands);
+    return;
+  }
+
+  if (msg.type === 'SET_MAX_HANDS') {
+    const nextMax = sanitizeMaxHands(msg.maxHands);
+    if (nextMax === maxHands) return;
+    maxHands = nextMax;
+    if (taskMode === 'HAND') {
+      void reconfigure('HAND', activeDelegate, nextMax);
+    }
     return;
   }
 
   if (msg.type === 'CLOSE') {
-    handLandmarker?.close();
-    handLandmarker = null;
-    handDelegate = null;
-    poseLandmarker?.close();
-    poseLandmarker = null;
-    poseDelegate = null;
+    closeHandModel();
+    closePoseModel();
     visionFileset = null;
     return;
   }
 
   if (msg.type === 'DETECT') {
-    const bitmap = msg.bitmap;
+    const { bitmap } = msg;
     if (!(bitmap instanceof ImageBitmap)) return;
 
     try {
       const currentTask = taskMode;
-      const activeModel = currentTask === 'POSE' ? poseLandmarker : handLandmarker;
-
-      if (!activeModel || isSwitching) {
+      const readyModel = currentTask === 'POSE' ? poseLandmarker : handLandmarker;
+      if (!readyModel || isSwitching) {
         self.postMessage({
           type: 'RESULT',
           taskMode: currentTask,
@@ -416,36 +420,6 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
 
       const inferMs = performance.now() - t0;
 
-      // Auto-Benchmark over 25 steady-state GPU frames (skipping first 3 cold warmup frames)
-      if (engineMode === 'AUTO' && !benchDone && activeDelegate === 'GPU') {
-        if (warmupCount < WARMUP_FRAMES) {
-          warmupCount += 1;
-        } else {
-          const now = performance.now();
-          if (benchCount === 0) benchStartMs = now;
-          if (benchPrevInputTs > 0) {
-            benchInputSpanSumMs += Math.max(0, msg.timestampMs - benchPrevInputTs);
-          }
-          benchPrevInputTs = msg.timestampMs;
-          benchCount += 1;
-          benchInferSumMs += inferMs;
-
-          if (benchCount >= BENCHMARK_FRAMES) {
-            benchDone = true;
-            const avgInferMs = benchInferSumMs / benchCount;
-            const elapsedSec = Math.max(0.05, (now - benchStartMs) / 1000);
-            const actualAiFps = benchCount / elapsedSec;
-            const avgInputCadenceMs =
-              benchCount > 1 ? benchInputSpanSumMs / (benchCount - 1) : 33.3;
-            const webcamFeeding30 = avgInputCadenceMs <= 45;
-
-            if (avgInferMs > GPU_MAX_AVG_INFER_MS || (webcamFeeding30 && actualAiFps < GPU_MIN_AI_FPS)) {
-              void hotSwitch(taskMode, 'CPU', 'auto-benchmark', avgInferMs);
-            }
-          }
-        }
-      }
-
       self.postMessage({
         type: 'RESULT',
         taskMode: currentTask,
@@ -466,6 +440,7 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
         timestampMs: msg.timestampMs,
       });
     } finally {
+      // Strictly release GPU/CPU bitmap memory immediately after every single frame
       try {
         bitmap.close();
       } catch {

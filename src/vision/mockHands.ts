@@ -357,12 +357,9 @@ function buildMockBodyPose(
     visibility: 0.95,
   }));
   const halfW = shoulderW * 0.5;
-  // 0: Nose
   pts[0] = { x: rawMidX, y: midY - shoulderW * 0.72, z: -0.05, visibility: 0.98 };
-  // 11: Left shoulder, 12: Right shoulder
   pts[11] = { x: rawMidX + halfW, y: midY, z: 0, visibility: 0.99 };
   pts[12] = { x: rawMidX - halfW, y: midY, z: 0, visibility: 0.99 };
-  // 13/14: Elbows, 15/16: Wrists
   if (handsUp) {
     pts[13] = { x: rawMidX + halfW * 1.35, y: midY - shoulderW * 0.45, z: -0.02, visibility: 0.97 };
     pts[14] = { x: rawMidX - halfW * 1.35, y: midY - shoulderW * 0.45, z: -0.02, visibility: 0.97 };
@@ -374,7 +371,6 @@ function buildMockBodyPose(
     pts[15] = { x: rawMidX + halfW * 1.12, y: midY + shoulderW * 1.18, z: -0.04, visibility: 0.97 };
     pts[16] = { x: rawMidX - halfW * 1.12, y: midY + shoulderW * 1.18, z: -0.04, visibility: 0.97 };
   }
-  // 23/24: Hips
   pts[23] = { x: rawMidX + halfW * 0.72, y: midY + shoulderW * 1.38, z: 0, visibility: 0.92 };
   pts[24] = { x: rawMidX - halfW * 0.72, y: midY + shoulderW * 1.38, z: 0, visibility: 0.92 };
   return pts;
@@ -384,35 +380,19 @@ function buildMockBodyPose(
 export function generateMockPose(pose: MockPoseId, elapsedSec: number): Landmark3D[] | null {
   const sw = 0.22;
   const baseY = 0.52;
-  if (pose === 'RUNNER_STAND') {
-    return buildMockBodyPose(0.5, baseY, sw, false);
-  }
-  if (pose === 'RUNNER_HANDS_UP') {
-    return buildMockBodyPose(0.5, baseY, sw, true);
-  }
-  if (pose === 'RUNNER_LEFT') {
-    // Mirrored: rawMidX = 0.65 -> screen midX = 0.35 -> dx = -0.68 -> Lane -1 (LEFT)
-    return buildMockBodyPose(0.65, baseY, sw, false);
-  }
-  if (pose === 'RUNNER_RIGHT') {
-    // Mirrored: rawMidX = 0.35 -> screen midX = 0.65 -> dx = +0.68 -> Lane +1 (RIGHT)
-    return buildMockBodyPose(0.35, baseY, sw, false);
-  }
-  if (pose === 'RUNNER_JUMP') {
-    // dyUp = (0.52 - 0.42) / 0.22 = +0.45 > 0.30 -> JUMP
-    return buildMockBodyPose(0.5, baseY - 0.1, sw, false);
-  }
-  if (pose === 'RUNNER_CROUCH') {
-    // dyDown = (0.62 - 0.52) / 0.22 = +0.45 > 0.32 -> CROUCH
-    return buildMockBodyPose(0.5, baseY + 0.1, sw, false);
-  }
+  if (pose === 'RUNNER_STAND') return buildMockBodyPose(0.5, baseY, sw, false);
+  if (pose === 'RUNNER_HANDS_UP') return buildMockBodyPose(0.5, baseY, sw, true);
+  if (pose === 'RUNNER_LEFT') return buildMockBodyPose(0.65, baseY, sw, false);
+  if (pose === 'RUNNER_RIGHT') return buildMockBodyPose(0.35, baseY, sw, false);
+  if (pose === 'RUNNER_JUMP') return buildMockBodyPose(0.5, baseY - 0.1, sw, false);
+  if (pose === 'RUNNER_CROUCH') return buildMockBodyPose(0.5, baseY + 0.1, sw, false);
   if (pose === 'RUNNER_DEMO_SEQ') {
     const phase = elapsedSec % 3.0;
     if (phase < 0.45) return buildMockBodyPose(0.5, baseY, sw, false);
-    if (phase < 1.05) return buildMockBodyPose(0.65, baseY, sw, false); // LEFT
-    if (phase < 1.65) return buildMockBodyPose(0.35, baseY, sw, false); // RIGHT
-    if (phase < 2.25) return buildMockBodyPose(0.5, baseY - 0.1, sw, false); // JUMP
-    return buildMockBodyPose(0.5, baseY + 0.1, sw, false); // CROUCH
+    if (phase < 1.05) return buildMockBodyPose(0.65, baseY, sw, false);
+    if (phase < 1.65) return buildMockBodyPose(0.35, baseY, sw, false);
+    if (phase < 2.25) return buildMockBodyPose(0.5, baseY - 0.1, sw, false);
+    return buildMockBodyPose(0.5, baseY + 0.1, sw, false);
   }
   return buildMockBodyPose(0.5, baseY, sw, false);
 }

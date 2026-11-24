@@ -1,13 +1,23 @@
-import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
-import type { GpuInfo, GpuTier } from '../types/vision';
+import { FilesetResolver, HandLandmarker, PoseLandmarker } from '@mediapipe/tasks-vision';
+import type {
+  AiEngineMode,
+  GpuInfo,
+  GpuTier,
+  MaxHandsOption,
+  TrackerTaskMode,
+} from '../types/vision';
 
 const MEDIAPIPE_WASM_ROOT = '/mediapipe';
 
 const HAND_LANDMARKER_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
-export interface HandTrackerInstance {
-  landmarker: HandLandmarker;
+const POSE_LANDMARKER_MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+
+export interface MainThreadTrackerInstance {
+  handLandmarker: HandLandmarker | null;
+  poseLandmarker: PoseLandmarker | null;
   gpuInfo: GpuInfo;
 }
 
@@ -25,10 +35,7 @@ function classifyGpuTier(renderer: string): GpuTier {
     lower.includes('geforce') ||
     lower.includes('rtx') ||
     lower.includes('gtx') ||
-    lower.includes('quadro') ||
-    lower.includes('radeon rx') ||
-    lower.includes('arc a') ||
-    lower.includes('arc b')
+    lower.includes('radeon rx')
   ) {
     return 'DISCRETE';
   }
@@ -36,8 +43,6 @@ function classifyGpuTier(renderer: string): GpuTier {
     lower.includes('intel') ||
     lower.includes('uhd') ||
     lower.includes('iris') ||
-    lower.includes('radeon(tm) graphics') ||
-    lower.includes('vega') ||
     lower.includes('apple m')
   ) {
     return 'INTEGRATED';
@@ -45,84 +50,97 @@ function classifyGpuTier(renderer: string): GpuTier {
   return 'UNKNOWN';
 }
 
-function detectWebGlRenderer(): { renderer: string; tier: GpuTier; hasWebGl2: boolean } {
+function detectWebGlRenderer(): { renderer: string; tier: GpuTier } {
   try {
     const canvas = document.createElement('canvas');
-    const gl2 = canvas.getContext('webgl2', { powerPreference: 'high-performance' });
-    const gl = gl2 || canvas.getContext('webgl', { powerPreference: 'high-performance' });
-    if (!gl) {
-      return { renderer: 'Trình duyệt không bật WebGL', tier: 'SOFTWARE', hasWebGl2: false };
-    }
+    const gl =
+      canvas.getContext('webgl2', { powerPreference: 'high-performance' }) ||
+      canvas.getContext('webgl', { powerPreference: 'high-performance' });
+    if (!gl) return { renderer: 'WebGL Unavailable', tier: 'SOFTWARE' };
     const debugExt = gl.getExtension('WEBGL_debug_renderer_info');
-    const rawRenderer = debugExt
+    const raw = debugExt
       ? String(gl.getParameter(debugExt.UNMASKED_RENDERER_WEBGL) ?? '')
       : String(gl.getParameter(gl.RENDERER) ?? '');
-
-    const cleaned = rawRenderer
+    const cleaned = raw
       .replace(/^ANGLE\s*\([^,]+,\s*/i, '')
       .replace(/\s*\(0x[0-9a-f]+\).*$/i, '')
       .replace(/\s*Direct3D11.*$/i, '')
       .replace(/\)\s*$/, '')
       .trim();
-
-    const renderer = cleaned || rawRenderer || 'WebGL GPU';
-    return { renderer, tier: classifyGpuTier(rawRenderer), hasWebGl2: Boolean(gl2) };
+    return { renderer: cleaned || raw || 'WebGL GPU', tier: classifyGpuTier(raw) };
   } catch {
-    return { renderer: 'Không rõ GPU', tier: 'UNKNOWN', hasWebGl2: false };
+    return { renderer: 'Unknown GPU', tier: 'UNKNOWN' };
   }
 }
 
-export async function createHandTracker(forceGpu = false): Promise<HandTrackerInstance> {
+async function buildModel(
+  vision: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>,
+  delegate: 'GPU' | 'CPU',
+  task: TrackerTaskMode,
+  numHands: MaxHandsOption,
+): Promise<{ handLandmarker: HandLandmarker | null; poseLandmarker: PoseLandmarker | null }> {
+  const gpuCanvas =
+    delegate === 'GPU'
+      ? Object.assign(document.createElement('canvas'), { width: 256, height: 144 })
+      : undefined;
+
+  if (task === 'POSE') {
+    const poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+      ...(gpuCanvas ? { canvas: gpuCanvas } : {}),
+      baseOptions: { modelAssetPath: POSE_LANDMARKER_MODEL_URL, delegate },
+      runningMode: 'VIDEO',
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.45,
+    });
+    return { handLandmarker: null, poseLandmarker };
+  }
+
+  const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    ...(gpuCanvas ? { canvas: gpuCanvas } : {}),
+    baseOptions: { modelAssetPath: HAND_LANDMARKER_MODEL_URL, delegate },
+    runningMode: 'VIDEO',
+    numHands,
+    minHandDetectionConfidence: 0.55,
+    minHandPresenceConfidence: 0.5,
+    minTrackingConfidence: 0.45,
+  });
+  return { handLandmarker, poseLandmarker: null };
+}
+
+/**
+ * Main-Thread GPU/CPU tracker fallback (used ONLY if Worker OffscreenCanvas lacks WebGL2):
+ * Keeps GPU delegate when requested; falls back to CPU only on genuine GPU hardware failure or CPU mode.
+ */
+export async function createMainThreadTracker(
+  wantDelegate: AiEngineMode,
+  task: TrackerTaskMode,
+  numHands: MaxHandsOption,
+): Promise<MainThreadTrackerInstance> {
   const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_ROOT);
   const detected = detectWebGlRenderer();
 
-  try {
-    // Dedicated untouched canvas required by MediaPipe VisionTaskOptions for GPU texture binding.
-    const gpuCanvas = document.createElement('canvas');
-    gpuCanvas.width = 480;
-    gpuCanvas.height = 270;
-
-    const landmarker = await HandLandmarker.createFromOptions(vision, {
-      canvas: gpuCanvas,
-      baseOptions: {
-        modelAssetPath: HAND_LANDMARKER_MODEL_URL,
-        delegate: 'GPU',
-      },
-      runningMode: 'VIDEO',
-      numHands: 2,
-      minHandDetectionConfidence: 0.35,
-      minHandPresenceConfidence: 0.35,
-      minTrackingConfidence: 0.4,
-    });
+  if (wantDelegate === 'CPU') {
+    const models = await buildModel(vision, 'CPU', task, numHands);
     return {
-      landmarker,
-      gpuInfo: {
-        delegate: 'GPU',
-        renderer: detected.renderer,
-        tier: detected.tier,
-      },
+      ...models,
+      gpuInfo: { delegate: 'CPU', renderer: `CPU (WASM) | ${detected.renderer}`, tier: 'SOFTWARE' },
+    };
+  }
+
+  try {
+    const models = await buildModel(vision, 'GPU', task, numHands);
+    return {
+      ...models,
+      gpuInfo: { delegate: 'GPU', renderer: detected.renderer, tier: detected.tier },
     };
   } catch (gpuError) {
     const reason = gpuError instanceof Error ? gpuError.message : String(gpuError);
-    if (forceGpu) {
-      throw new Error(
-        `Không thể khởi chạy WebGL GPU (${detected.renderer}). Lý do: ${reason}. Hãy bật Hardware Acceleration trong trình duyệt hoặc tắt ép GPU.`,
-      );
-    }
-    console.warn('GPU delegate unavailable, falling back to CPU:', gpuError);
-    const landmarker = await HandLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath: HAND_LANDMARKER_MODEL_URL,
-        delegate: 'CPU',
-      },
-      runningMode: 'VIDEO',
-      numHands: 2,
-      minHandDetectionConfidence: 0.35,
-      minHandPresenceConfidence: 0.35,
-      minTrackingConfidence: 0.4,
-    });
+    console.warn('Main-thread GPU delegate unavailable, falling back to CPU:', gpuError);
+    const models = await buildModel(vision, 'CPU', task, numHands);
     return {
-      landmarker,
+      ...models,
       gpuInfo: {
         delegate: 'CPU',
         renderer: `CPU (WASM) | ${detected.renderer}`,

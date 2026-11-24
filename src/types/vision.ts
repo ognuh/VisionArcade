@@ -16,13 +16,15 @@ export interface GpuInfo {
   fallbackReason?: string;
 }
 
-export type AiEngineMode = 'GPU' | 'AUTO' | 'CPU';
+export type AiEngineMode = 'GPU' | 'CPU';
 
 export type TrackerTaskMode = 'HAND' | 'POSE';
 
-export type GraphicsQuality = 'ULTRA' | 'HIGH';
+export type GraphicsQuality = 'PRO' | 'ULTRA';
 
-export type FpsTarget = 'MAX' | 120 | 60;
+export type FpsTarget = 120 | 60 | 'MAX';
+
+export type MaxHandsOption = 2 | 1;
 
 export type PrismModeId =
   | 'AUTO'
@@ -71,4 +73,5 @@ export interface PrismSettings {
   aiEngineMode: AiEngineMode;
   graphicsQuality: GraphicsQuality;
   fpsTarget: FpsTarget;
+  maxHands: MaxHandsOption;
 }

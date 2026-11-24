@@ -177,22 +177,22 @@ void main() {
       vec3 refracted = vec3(rCh, gCh, bCh);
 
       // Glossy Fresnel specular highlights + shimmering aquatic caustics on convex crests
-      vec3 N = normalize(vec3(-grad.x * 8.4, -grad.y * 8.4, 1.0));
+      vec3 N = normalize(vec3(-grad.x * 9.2, -grad.y * 9.2, 1.0));
       vec3 V = vec3(0.0, 0.0, 1.0);
       vec3 L1 = normalize(vec3(-0.38, 0.48, 0.79));
       vec3 L2 = normalize(vec3(0.45, -0.35, 0.82));
 
-      float fresnel = pow(1.0 - max(dot(N, V), 0.0), 2.8) * uRippleStrength;
-      float spec1 = pow(max(dot(N, normalize(L1 + V)), 0.0), 64.0) * 0.82;
-      float spec2 = pow(max(dot(N, normalize(L2 + V)), 0.0), 36.0) * 0.34;
+      float fresnel = pow(1.0 - max(dot(N, V), 0.0), 2.6) * uRippleStrength;
+      float spec1 = pow(max(dot(N, normalize(L1 + V)), 0.0), 72.0) * 0.92;
+      float spec2 = pow(max(dot(N, normalize(L2 + V)), 0.0), 38.0) * 0.42;
       float spec = (spec1 + spec2) * uRippleStrength;
 
       float lap = max(0.0, hC * 4.0 - (hML + hMR + hTC + hBC));
-      float caustics = (smoothstep(0.010, 0.12, lap) * 0.28 + smoothstep(0.04, 0.22, lap) * 0.16) * uRippleStrength;
+      float caustics = (smoothstep(0.009, 0.11, lap) * 0.34 + smoothstep(0.035, 0.20, lap) * 0.22) * uRippleStrength;
 
       vec3 glassLight =
-        vec3(0.95, 0.98, 1.0) * spec +
-        vec3(0.48, 0.86, 1.0) * (fresnel * 0.38 + caustics);
+        vec3(0.96, 0.99, 1.0) * spec +
+        vec3(0.42, 0.88, 1.0) * (fresnel * 0.44 + caustics);
 
       fragColor = vec4(clamp(refracted + glassLight, 0.0, 1.0), 1.0);
       return;
@@ -254,24 +254,29 @@ void main() {
     float bCh = texture(uVideo, clamp(uv + totalShift - caShift, 0.002, 0.998)).b;
     vec3 refracted = vec3(rCh, gCh, bCh);
 
-    // 4. Subtle 5-tap frosted VisionOS optical glass micro-blur
-    vec2 bOff = uVideoTexel * (1.6 + bevel * 1.4);
+    // 4. Crisp 9-tap circular VisionOS frosted optical bokeh micro-blur
+    vec2 bOff = uVideoTexel * (1.8 + bevel * 1.6);
+    vec2 bDiag = bOff * 0.7071;
     vec3 frosted =
-      refracted * 0.46 +
-      (texture(uVideo, clamp(baseUv + vec2( bOff.x,  bOff.y), 0.002, 0.998)).rgb +
-       texture(uVideo, clamp(baseUv + vec2(-bOff.x,  bOff.y), 0.002, 0.998)).rgb +
-       texture(uVideo, clamp(baseUv + vec2( bOff.x, -bOff.y), 0.002, 0.998)).rgb +
-       texture(uVideo, clamp(baseUv + vec2(-bOff.x, -bOff.y), 0.002, 0.998)).rgb) * 0.135;
-    vec3 glassSample = mix(refracted, frosted, 0.34 + bevel * 0.22);
+      refracted * 0.28 +
+      (texture(uVideo, clamp(baseUv + vec2( bOff.x,  0.0),     0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2(-bOff.x,  0.0),     0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2( 0.0,     bOff.y),  0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2( 0.0,    -bOff.y),  0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2( bDiag.x,  bDiag.y), 0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2(-bDiag.x,  bDiag.y), 0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2( bDiag.x, -bDiag.y), 0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2(-bDiag.x, -bDiag.y), 0.002, 0.998)).rgb) * 0.09;
+    vec3 glassSample = mix(refracted, frosted, 0.36 + bevel * 0.24);
 
     // 5. 3D bevel surface lighting, top-left specular catchlight & crisp white crystal rim sheen
-    vec3 bevelN = normalize(vec3(-bestInNormal * bevel * 1.55, 1.0));
+    vec3 bevelN = normalize(vec3(-bestInNormal * bevel * 1.65, 1.0));
     vec3 lightDir = normalize(vec3(-0.45, -0.55, 0.70));
-    float spec = pow(max(dot(bevelN, lightDir), 0.0), 38.0) * bevel * 0.54;
-    float rimGlow = smoothstep(0.66, 0.99, bevel) * 0.36;
-    float domeSheen = pow(max(0.0, 1.0 - length((vScreenUv - uLensCenter) * 2.4)), 2.0) * 0.055;
+    float spec = pow(max(dot(bevelN, lightDir), 0.0), 42.0) * bevel * 0.62;
+    float rimGlow = smoothstep(0.64, 0.99, bevel) * 0.42;
+    float domeSheen = pow(max(0.0, 1.0 - length((vScreenUv - uLensCenter) * 2.3)), 2.0) * 0.075;
 
-    vec3 crystal = glassSample * 1.05 + vec3(0.015, 0.028, 0.048) * (0.38 + bevel * 0.62);
+    vec3 crystal = glassSample * 1.06 + vec3(0.018, 0.032, 0.056) * (0.40 + bevel * 0.60);
     crystal += vec3(0.96, 0.99, 1.0) * (spec + rimGlow + domeSheen);
     fragColor = vec4(clamp(crystal, 0.0, 1.0), 0.98 * uTint.a);
     return;
@@ -282,18 +287,25 @@ void main() {
   float luma = lumaOf(cam);
 
   if (uShaderType == 1) {
+    // Pro Studio FLIR Thermal: Sobel edge contour + crisp isotherm shimmer
     vec2 t = uVideoTexel * 2.0;
-    float lR = lumaOf(texture(uVideo, clamp(uv + vec2(t.x, 0.0), 0.002, 0.998)).rgb);
-    float lU = lumaOf(texture(uVideo, clamp(uv + vec2(0.0, t.y), 0.002, 0.998)).rgb);
-    float edge = clamp((abs(lR - luma) + abs(lU - luma)) * 4.5, 0.0, 1.0);
-    float stretched = clamp((luma - 0.08) * 1.48 + edge * 0.22, 0.0, 1.0);
-    vec3 thermal = thermalFalseColor(stretched);
+    float lR = lumaOf(texture(uVideo, clamp(uv + vec2( t.x, 0.0), 0.002, 0.998)).rgb);
+    float lL = lumaOf(texture(uVideo, clamp(uv + vec2(-t.x, 0.0), 0.002, 0.998)).rgb);
+    float lU = lumaOf(texture(uVideo, clamp(uv + vec2(0.0,  t.y), 0.002, 0.998)).rgb);
+    float lD = lumaOf(texture(uVideo, clamp(uv + vec2(0.0, -t.y), 0.002, 0.998)).rgb);
+    float edge = clamp((abs(lR - lL) + abs(lU - lD)) * 3.4, 0.0, 1.0);
+    float stretched = clamp((luma - 0.07) * 1.52 + edge * 0.24, 0.0, 1.0);
+    float iso = smoothstep(0.93, 0.99, abs(sin(stretched * 25.1327))) * 0.08;
+    vec3 thermal = clamp(thermalFalseColor(stretched) + vec3(iso * 0.6, iso * 0.9, iso), 0.0, 1.0);
     fragColor = vec4(thermal, 0.98 * uTint.a);
     return;
   }
 
-  // Chromatic Prism Ribbon
-  float hiContrast = clamp((luma - 0.48) * 1.48 + 0.64, 0.28, 1.36);
+  // Chromatic Prism Ribbon with subtle optical RGB spectral dispersion
+  vec2 pShift = uVideoTexel * 3.0;
+  float lR = lumaOf(texture(uVideo, clamp(uv + vec2( pShift.x, 0.0), 0.002, 0.998)).rgb);
+  float lB = lumaOf(texture(uVideo, clamp(uv + vec2(-pShift.x, 0.0), 0.002, 0.998)).rgb);
+  vec3 hiContrast = clamp((vec3(lR, luma, lB) - 0.46) * 1.52 + 0.66, 0.28, 1.38);
   vec3 prismCol = uTint.rgb * hiContrast;
   fragColor = vec4(prismCol, uTint.a);
 }
@@ -824,7 +836,7 @@ export class OpticalPrismEngine {
   }
 
   getFluidParticleCount(): number {
-    return this.cosmosFx?.getFluidParticleCount() ?? 15000;
+    return this.cosmosFx?.getFluidParticleCount() ?? 12000;
   }
 
   startRunner(skipCountdown = false): void {
@@ -1440,7 +1452,7 @@ export class OpticalPrismEngine {
     // --- Single-Pass WebGL2 Webcam Pass-Through (+ Liquid Glass Ripple) + Optical Polygons ---
     gl.useProgram(this.program);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, viewW, viewH);
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);

@@ -22,6 +22,7 @@ import type {
   CameraPresetId,
   FpsTarget,
   GraphicsQuality,
+  MaxHandsOption,
   PrismModeId,
   PrismSettings,
 } from '../types/vision';
@@ -39,6 +40,7 @@ interface PrismBarProps {
   fpsTextRef: RefObject<HTMLSpanElement | null>;
   camFpsTextRef: RefObject<HTMLSpanElement | null>;
   aiFpsTextRef: RefObject<HTMLSpanElement | null>;
+  aiMsTextRef: RefObject<HTMLSpanElement | null>;
   modeTextRef: RefObject<HTMLSpanElement | null>;
   uiRootRef: RefObject<HTMLDivElement | null>;
   dockNavRef: RefObject<HTMLElement | null>;
@@ -71,20 +73,24 @@ const CAMERA_PRESETS: { id: CameraPresetId; label: string }[] = [
 ];
 
 const QUALITY_MODES: { id: GraphicsQuality; label: string }[] = [
-  { id: 'ULTRA', label: 'Ultra' },
-  { id: 'HIGH', label: 'High' },
+  { id: 'PRO', label: 'Pro' },
+  { id: 'ULTRA', label: 'Ultra (Max)' },
 ];
 
 const FPS_TARGETS: { id: FpsTarget; label: string }[] = [
-  { id: 'MAX', label: 'Max Hz' },
-  { id: 120, label: '120' },
   { id: 60, label: '60' },
+  { id: 120, label: '120' },
+  { id: 'MAX', label: 'Max Hz' },
 ];
 
 const AI_ENGINE_MODES: { id: AiEngineMode; label: string }[] = [
   { id: 'GPU', label: 'GPU' },
-  { id: 'AUTO', label: 'Auto' },
   { id: 'CPU', label: 'CPU' },
+];
+
+const MAX_HANDS_OPTIONS: { id: MaxHandsOption; label: string }[] = [
+  { id: 2, label: '2 Hands' },
+  { id: 1, label: '1 Hand' },
 ];
 
 const DRAW_COLOR_KEYS: AirDrawColorId[] = ['CYAN', 'MAGENTA', 'GREEN', 'GOLD'];
@@ -134,6 +140,7 @@ export function PrismBar({
   fpsTextRef,
   camFpsTextRef,
   aiFpsTextRef,
+  aiMsTextRef,
   modeTextRef,
   uiRootRef,
   dockNavRef,
@@ -230,11 +237,11 @@ export function PrismBar({
 
   return (
     <>
-      {/* Top-Left Minimalist Pro Telemetry Pill */}
-      <header className="pointer-events-none fixed top-4 left-4 z-20">
+      {/* Top-Left Minimalist VisionOS Telemetry Pill + Smart Gesture Hint Pill */}
+      <header className="pointer-events-none fixed top-4 left-4 z-20 flex flex-col items-start gap-2">
         <div
           data-testid="telemetry-pill"
-          className="pointer-events-auto inline-flex h-7 items-center gap-2 rounded-full border border-white/12 bg-neutral-950/60 px-3 font-mono text-[11px] backdrop-blur-2xl"
+          className="pointer-events-auto inline-flex h-7 items-center gap-2 rounded-full border border-white/15 bg-neutral-950/65 px-3 font-mono text-[11px] shadow-[0_8px_28px_rgba(0,0,0,0.4)] backdrop-blur-2xl"
         >
           <span className="font-sans text-[11px] font-semibold tracking-tight text-white/95">
             VisionArcade
@@ -245,10 +252,10 @@ export function PrismBar({
           <span className="inline-flex items-center gap-1.5 text-white/90 tabular-nums">
             <span
               aria-hidden="true"
-              className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.75)]"
+              className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]"
             />
             <span>
-              <span ref={fpsTextRef}>120</span> FPS
+              <span ref={fpsTextRef}>60</span> FPS
             </span>
           </span>
           <span className="text-white/25" aria-hidden="true">
@@ -260,15 +267,16 @@ export function PrismBar({
           <span className="text-white/25" aria-hidden="true">
             ·
           </span>
-          <span className="text-white/65 tabular-nums">
-            AI <span ref={aiFpsTextRef}>60</span> ({activeAiDelegate})
+          <span className="text-white/70 tabular-nums">
+            AI <span ref={aiFpsTextRef}>60</span> ({activeAiDelegate} ·{' '}
+            <span ref={aiMsTextRef}>8</span>ms)
           </span>
           <span className="text-white/25" aria-hidden="true">
             ·
           </span>
           <span
             ref={modeTextRef}
-            className="font-medium tracking-[0.05em] text-white/90 uppercase"
+            className="font-medium tracking-[0.05em] text-white/95 uppercase"
           >
             {settings.airDrawEnabled ? 'AIR DRAW' : settings.mode}
           </span>
@@ -298,15 +306,15 @@ export function PrismBar({
             aria-label="Studio Settings"
             data-testid="studio-inspector"
             onPointerMove={onDockActivity}
-            className="inspector-panel-enter pointer-events-auto fixed right-4 bottom-20 z-30 flex max-h-[calc(100vh-110px)] w-[292px] flex-col gap-2.5 overflow-y-auto rounded-2xl border border-white/12 bg-neutral-950/65 p-3.5 shadow-[0_24px_64px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
+            className="inspector-panel-enter pointer-events-auto fixed right-4 bottom-20 z-30 flex max-h-[calc(100vh-110px)] w-[294px] flex-col gap-2.5 overflow-y-auto rounded-2xl border border-white/15 bg-neutral-950/65 p-3.5 shadow-[0_24px_64px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
           >
-            {/* Section 1: Camera Source & Max FPS Presets */}
+            {/* Section 1: Camera Source & 60 FPS Presets */}
             <section className="flex flex-col gap-2 border-b border-white/8 pb-2.5">
               <div className="flex items-center justify-between">
                 <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
                   Camera Source
                 </h2>
-                <span className="font-mono text-[10px] text-white/35">60 FPS Ready</span>
+                <span className="font-mono text-[10px] text-white/35">OBS 60 FPS</span>
               </div>
 
               <div className="relative">
@@ -365,14 +373,14 @@ export function PrismBar({
               </div>
             </section>
 
-            {/* Section 2: Performance & Graphics Quality */}
+            {/* Section 2: Graphics Quality & FPS Target */}
             <section className="flex flex-col gap-2 border-b border-white/8 pb-2.5">
               <div className="flex items-center justify-between">
                 <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
                   Graphics Quality
                 </h2>
                 <span className="font-mono text-[10px] text-white/40">
-                  {settings.graphicsQuality === 'ULTRA' ? '15K · 512p' : '9K · 384p'}
+                  {settings.graphicsQuality === 'ULTRA' ? '12K · 384p' : '8K · 320p'}
                 </span>
               </div>
 
@@ -438,19 +446,21 @@ export function PrismBar({
               </div>
             </section>
 
-            {/* Section 3: AI Engine Delegate Selector */}
-            <section className="flex flex-col gap-1.5 border-b border-white/8 pb-2.5">
+            {/* Section 3: AI Engine (GPU / CPU) & Max Hands (2 / 1) */}
+            <section className="flex flex-col gap-2 border-b border-white/8 pb-2.5">
               <div className="flex items-center justify-between">
                 <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
                   AI Engine
                 </h2>
-                <span className="font-mono text-[10px] text-white/40">{activeAiDelegate}</span>
+                <span className="font-mono text-[10px] text-white/40">
+                  {activeAiDelegate} · 256p
+                </span>
               </div>
 
               <div
                 role="group"
                 aria-label="AI Engine Delegate"
-                className="grid grid-cols-3 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
+                className="grid grid-cols-2 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
               >
                 {AI_ENGINE_MODES.map((eng) => {
                   const active = settings.aiEngineMode === eng.id;
@@ -468,6 +478,39 @@ export function PrismBar({
                       }`}
                     >
                       {eng.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="flex items-center justify-between pt-0.5">
+                <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+                  Max Hands
+                </h2>
+                <span className="font-mono text-[10px] text-white/40">{settings.maxHands}</span>
+              </div>
+
+              <div
+                role="group"
+                aria-label="Max Hands"
+                className="grid grid-cols-2 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
+              >
+                {MAX_HANDS_OPTIONS.map((opt) => {
+                  const active = settings.maxHands === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      data-air-clickable="true"
+                      aria-pressed={active}
+                      onClick={() => onSettingsChange({ maxHands: opt.id })}
+                      className={`inline-flex h-6 items-center justify-center rounded-md text-[11px] font-medium transition-colors duration-200 ${
+                        active
+                          ? 'bg-white text-black shadow-xs'
+                          : 'text-white/60 hover:text-white'
+                      }`}
+                    >
+                      {opt.label}
                     </button>
                   );
                 })}
@@ -506,7 +549,7 @@ export function PrismBar({
               />
             </section>
 
-            {/* Air Draw Palette (revealed when Air Draw is active) */}
+            {/* Air Draw Palette */}
             {settings.airDrawEnabled && (
               <section className="flex flex-col gap-2 border-t border-white/8 pt-2.5">
                 <div className="flex items-center justify-between">
@@ -566,7 +609,7 @@ export function PrismBar({
           </aside>
         )}
 
-        {/* Bottom Centered VisionOS Floating Dock */}
+        {/* Bottom Centered VisionOS Floating Dock (Always Crisp & OBS-Ready) */}
         <nav
           ref={dockNavRef}
           aria-label="Effect Modes and Tools"
@@ -574,9 +617,9 @@ export function PrismBar({
           onPointerEnter={onDockActivity}
           onPointerMove={onDockActivity}
           style={{ transform: 'translateX(-50%) scale(1)', opacity: 1 }}
-          className="pointer-events-auto fixed bottom-5 left-1/2 flex h-11 max-w-[96vw] items-center gap-1 rounded-full border border-white/12 bg-neutral-950/60 px-2 shadow-[0_16px_48px_rgba(0,0,0,0.48)] backdrop-blur-2xl transition-[opacity,transform] duration-300 ease-out"
+          className="pointer-events-auto fixed bottom-5 left-1/2 flex h-11 max-w-[96vw] items-center gap-1 rounded-full border border-white/15 bg-neutral-950/65 px-2 shadow-[0_16px_48px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-transform duration-300 ease-out"
         >
-          {/* Core Mode Buttons with Smooth Sliding Active Pill */}
+          {/* Core Mode Buttons with Elastic Sliding Active Pill */}
           <div className="relative flex items-center gap-0.5">
             <span
               aria-hidden="true"
@@ -585,7 +628,7 @@ export function PrismBar({
                 width: `${pillRect.w}px`,
                 opacity: pillRect.visible ? 1 : 0,
               }}
-              className="pointer-events-none absolute top-0 bottom-0 left-0 rounded-full bg-white shadow-xs transition-[transform,width,opacity] duration-250 ease-out"
+              className="pointer-events-none absolute top-0 bottom-0 left-0 rounded-full bg-white shadow-xs transition-[transform,width,opacity] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
             />
             {MODES.map((m, idx) => {
               const Icon = m.icon;

@@ -1,6 +1,6 @@
 import { createGlowSprite32, type HandPose2D } from './types';
 
-const EMBER_POOL_SIZE = 220;
+const EMBER_POOL_SIZE = 280;
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;

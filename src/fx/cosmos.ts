@@ -82,8 +82,8 @@ const SWITCH_COOLDOWN_SEC = 0.85;
 const SWITCH_DURATION_SEC = 0.65; // 650ms GLSL Simplex Dissolve -> Coalesce planet transition
 const PLANET_DISSOLVE_SEC = 0.65; // 650ms Ethereal Dissolve when retracting hands
 const HUD_DISPLAY_SEC = 2.6;
-const BURST_PARTICLE_COUNT = 1000; // 1,000 3D Curl-Noise Stardust Dissolve Particles (Ultra Cinema)
-const BH_STAR_COUNT = 1500;
+const BURST_PARTICLE_COUNT = 1400; // 1,400 3D Curl-Noise Stardust Dissolve Particles (Ultra Max)
+const BH_STAR_COUNT = 2200;
 const CAMERA_FOV_DEG = 42;
 const CAMERA_Z = 10;
 
@@ -217,8 +217,9 @@ const ALPHA_OUTPUT_SHADER = {
   uniforms: {
     tDiffuse: { value: null as THREE.Texture | null },
     tSceneAlpha: { value: null as THREE.Texture | null },
-    uExposure: { value: 1.08 },
+    uExposure: { value: 1.10 },
     uDarkCoreSuppress: { value: 1.0 },
+    uFluidCap: { value: 0.0 },
   },
   vertexShader: `
     varying vec2 vUv;
@@ -232,6 +233,7 @@ const ALPHA_OUTPUT_SHADER = {
     uniform sampler2D tSceneAlpha;
     uniform float uExposure;
     uniform float uDarkCoreSuppress;
+    uniform float uFluidCap;
     varying vec2 vUv;
 
     vec3 acesToneMap(vec3 x) {
@@ -252,11 +254,16 @@ const ALPHA_OUTPUT_SHADER = {
       float darkCoreMask = smoothstep(0.06, 0.0, sceneLuma) * smoothstep(0.88, 0.99, sceneRaw.a) * uDarkCoreSuppress;
       vec3 hdr = mix(bloomed, bloomed * 0.14, darkCoreMask) * uExposure;
 
+      // Dedicated Fluid HDR highlight shoulder keeps overlapping 15k silk ribbons translucent & color-rich
+      if (uFluidCap > 0.5) {
+        hdr = hdr / (1.0 + hdr * 0.42);
+      }
+
       vec3 mapped = acesToneMap(hdr);
       vec3 srgb = pow(mapped, vec3(1.0 / 2.2));
 
-      float bloomAlpha = clamp(max(srgb.r, max(srgb.g, srgb.b)) * 1.18, 0.0, 1.0);
-      float finalAlpha = clamp(max(sceneRaw.a, bloomAlpha), 0.0, 1.0);
+      float bloomAlpha = clamp(max(srgb.r, max(srgb.g, srgb.b)) * (uFluidCap > 0.5 ? 1.04 : 1.18), 0.0, 1.0);
+      float finalAlpha = clamp(max(sceneRaw.a, bloomAlpha), 0.0, uFluidCap > 0.5 ? 0.92 : 1.0);
 
       if (finalAlpha < 0.004) discard;
       gl_FragColor = vec4(srgb, finalAlpha);
@@ -1400,13 +1407,14 @@ export class Cosmos3DEngine {
   private sphereGeo: THREE.SphereGeometry | null = null;
   private atmoGeo: THREE.SphereGeometry | null = null;
 
-  // Shared Three.js Volumetric Plasma Lightning, 15k Fluid Sandbox & Ultra 3D Runner (1 WebGL context / 1 Half-Res Bloom)
+  // Shared Three.js Volumetric Plasma Lightning, 12k Fluid Sandbox & Neon Subway Runner (1 WebGL context / Half-Res Bloom)
   private lightning3D = new Lightning3DEngine();
   private fluidSandbox = new FluidParticleSandbox();
   private runner3D = new Runner3DGame();
   private gltfLoader = new GLTFLoader();
   private customGlbGroup: THREE.Group | null = null;
   private customGlbLabel = '';
+  private currentDpr = 1;
 
   private burstPoints: THREE.Points | null = null;
   private burstMat: THREE.ShaderMaterial | null = null;
@@ -1480,7 +1488,9 @@ export class Cosmos3DEngine {
       powerPreference: 'high-performance',
       premultipliedAlpha: true,
     });
-    this.renderer.setPixelRatio(1);
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    this.currentDpr = dpr;
+    this.renderer.setPixelRatio(dpr);
     this.renderer.setClearColor(0x000000, 0);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.08;
@@ -1620,7 +1630,7 @@ export class Cosmos3DEngine {
     this.fluidSandbox.root.visible = true;
     if (this.burstPoints) this.burstPoints.visible = true;
 
-    // Compile all shaders (Cosmos + Dissolve + 3D Lightning + 15k Fluid + Runner + UnrealBloomPass) offscreen
+    // Compile all shaders (Cosmos + Dissolve + 3D Lightning + 12k Fluid + Runner + UnrealBloomPass) offscreen
     this.renderer.compile(this.scene, this.camera);
     this.renderer.compile(this.runner3D.scene, this.runner3D.camera);
     this.renderer.setRenderTarget(this.sceneRT);
@@ -1739,17 +1749,29 @@ export class Cosmos3DEngine {
   resize(width: number, height: number): void {
     const w = Math.max(1, Math.floor(width));
     const h = Math.max(1, Math.floor(height));
-    if (w === this.viewW && h === this.viewH && this.canvas.width === w && this.canvas.height === h) {
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    const bufW = Math.max(1, Math.round(w * dpr));
+    const bufH = Math.max(1, Math.round(h * dpr));
+    if (
+      w === this.viewW &&
+      h === this.viewH &&
+      dpr === this.currentDpr &&
+      this.canvas.width === bufW &&
+      this.canvas.height === bufH
+    ) {
       return;
     }
     this.viewW = w;
     this.viewH = h;
+    this.currentDpr = dpr;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this.renderer.setPixelRatio(dpr);
     this.renderer.setSize(w, h, false);
-    this.sceneRT.setSize(w, h);
+    this.sceneRT.setSize(bufW, bufH);
+    this.composer.setPixelRatio(dpr);
     this.composer.setSize(w, h);
-    this.bloomPass.setSize(Math.max(1, Math.floor(w / 2)), Math.max(1, Math.floor(h / 2)));
+    this.bloomPass.setSize(Math.max(1, Math.floor(bufW / 2)), Math.max(1, Math.floor(bufH / 2)));
   }
 
   clear(): void {
@@ -2142,7 +2164,6 @@ export class Cosmos3DEngine {
     this.ensureCoreResources();
     this.time += dt;
 
-    // Exclusive Ultra 3D Neon Subway Runner Pass (shares single Half-Res UnrealBloomPass + ACES tone map)
     if (runnerActive && bodyState) {
       this.planetContainer.visible = false;
       this.bhRoot.visible = false;
@@ -2160,12 +2181,13 @@ export class Cosmos3DEngine {
       );
 
       this.outputPass.uniforms.uDarkCoreSuppress.value = 0.0;
+      this.outputPass.uniforms.uFluidCap.value = 0.0;
       const prevStrength = this.bloomPass.strength;
       const prevRadius = this.bloomPass.radius;
       const prevThreshold = this.bloomPass.threshold;
-      this.bloomPass.strength = 0.40;
-      this.bloomPass.radius = 0.32;
-      this.bloomPass.threshold = 0.82;
+      this.bloomPass.strength = 0.44;
+      this.bloomPass.radius = 0.34;
+      this.bloomPass.threshold = 0.78;
 
       this.renderer.setRenderTarget(this.sceneRT);
       this.renderer.setClearColor(0x050612, 1);
@@ -2223,11 +2245,39 @@ export class Cosmos3DEngine {
     }
 
     if (anyCosmos || anyLightning || anyFluid) {
+      const fluidOnly = anyFluid && !anyCosmos && !anyLightning;
+      const lightningOnly = anyLightning && !anyCosmos && !anyFluid;
+      const prevStrength = this.bloomPass.strength;
+      const prevRadius = this.bloomPass.radius;
+      const prevThreshold = this.bloomPass.threshold;
+      if (fluidOnly) {
+        // Balanced Pro Studio Bloom + soft HDR ceiling for 15k Fluid energy silk
+        this.bloomPass.strength = 0.46;
+        this.bloomPass.radius = 0.42;
+        this.bloomPass.threshold = 0.56;
+        this.outputPass.uniforms.uFluidCap.value = 1.0;
+      } else if (lightningOnly) {
+        this.bloomPass.strength = 0.88;
+        this.bloomPass.radius = 0.62;
+        this.bloomPass.threshold = 0.52;
+        this.outputPass.uniforms.uFluidCap.value = 0.0;
+      } else {
+        this.bloomPass.strength = 0.78;
+        this.bloomPass.radius = 0.62;
+        this.bloomPass.threshold = 0.56;
+        this.outputPass.uniforms.uFluidCap.value = 0.0;
+      }
+
       this.renderer.setRenderTarget(this.sceneRT);
       this.renderer.clear();
       this.renderer.render(this.scene, this.camera);
       this.renderer.setRenderTarget(null);
       this.composer.render();
+
+      this.bloomPass.strength = prevStrength;
+      this.bloomPass.radius = prevRadius;
+      this.bloomPass.threshold = prevThreshold;
+      this.outputPass.uniforms.uFluidCap.value = 0.0;
       this.hasRenderedFrame = true;
     } else {
       this.clear();

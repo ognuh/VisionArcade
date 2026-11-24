@@ -1,6 +1,12 @@
-import type { HandLandmarker } from '@mediapipe/tasks-vision';
-import type { AiEngineMode, GpuInfo, Landmark3D, TrackerTaskMode } from '../types/vision';
-import { createHandTracker } from './handTracker';
+import type { HandLandmarker, PoseLandmarker } from '@mediapipe/tasks-vision';
+import type {
+  AiEngineMode,
+  GpuInfo,
+  Landmark3D,
+  MaxHandsOption,
+  TrackerTaskMode,
+} from '../types/vision';
+import { createMainThreadTracker } from './handTracker';
 
 export interface TrackingResultPacket {
   taskMode: TrackerTaskMode;
@@ -8,24 +14,26 @@ export interface TrackingResultPacket {
   poseLandmarks: Landmark3D[] | null;
   aiFps: number;
   inferMs: number;
+  avgInferMs: number;
   delegate: 'GPU' | 'CPU';
 }
 
-const AI_W = 320;
-const AI_H = 180;
+const AI_W = 256;
+const AI_H = 144;
 const FPS_WINDOW_SIZE = 20;
 
 /**
- * Direct Zero-Copy Unified Hand / Pose Tracker Client (320x180 Hardware Resize + Latest-Frame 1-Slot Queue):
- * - Mutually exclusive taskMode: 'HAND' for VFX modes, 'POSE' (pose_landmarker_lite) for Runner mode.
- * - Captures hardware-scaled 320x180 ImageBitmap on main thread and transfers zero-copy to Worker.
- * - Latest-Frame Slot eliminates 30 -> 15 FPS halving and strictly closes superseded bitmaps (0 leaks).
+ * Clean Unthrottled Zero-Copy GPU Tracker Client (256x144):
+ * - Simple inFlight lock + 1-slot latestBitmap queue synced directly to requestVideoFrameCallback.
+ * - Immediately closes every ImageBitmap in finally and whenever superseded (0 VRAM leaks).
+ * - Locked GPU delegate by default; zero artificial idle throttling or backpressure frame-skipping.
  */
 export class HandTrackerClient {
   private worker: Worker | null = null;
-  private fallbackLandmarker: HandLandmarker | null = null;
-  private fallbackCanvas: HTMLCanvasElement | null = null;
-  private fallbackCtx: CanvasRenderingContext2D | null = null;
+  private mainHandLandmarker: HandLandmarker | null = null;
+  private mainPoseLandmarker: PoseLandmarker | null = null;
+  private mainCanvas: HTMLCanvasElement | null = null;
+  private mainCtx: CanvasRenderingContext2D | null = null;
 
   private isProcessing = false;
   private isCapturing = false;
@@ -36,6 +44,7 @@ export class HandTrackerClient {
 
   private engineMode: AiEngineMode = 'GPU';
   private taskMode: TrackerTaskMode = 'HAND';
+  private maxHands: MaxHandsOption = 2;
   private activeDelegate: 'GPU' | 'CPU' = 'GPU';
   private avgInferMs = 0;
   private lastDetectTs = 0;
@@ -58,11 +67,13 @@ export class HandTrackerClient {
     initialEngineMode: AiEngineMode = 'GPU',
     onDelegateChange?: (delegate: 'GPU' | 'CPU') => void,
     initialTaskMode: TrackerTaskMode = 'HAND',
+    initialMaxHands: MaxHandsOption = 2,
   ): Promise<GpuInfo> {
     this.onResultCallback = onResult;
     this.onDelegateChangeCallback = onDelegateChange ?? null;
     this.engineMode = initialEngineMode;
     this.taskMode = initialTaskMode;
+    this.maxHands = initialMaxHands;
 
     const canUseWorker =
       typeof Worker !== 'undefined' &&
@@ -71,26 +82,42 @@ export class HandTrackerClient {
 
     if (canUseWorker) {
       try {
-        const gpuInfo = await this.initWorker(initialEngineMode, initialTaskMode);
+        const gpuInfo = await this.initWorker(initialEngineMode, initialTaskMode, initialMaxHands);
         this.gpuInfo = gpuInfo;
         return gpuInfo;
       } catch (err) {
-        console.warn('Web Worker HandLandmarker unavailable, falling back to main thread:', err);
         this.worker?.terminate();
         this.worker = null;
+        if (initialEngineMode === 'CPU') {
+          console.warn('Worker CPU tracker unavailable, using main thread:', err);
+        }
       }
     }
 
-    const tracker = await createHandTracker(false);
+    return this.initMainThreadFallback(initialEngineMode, initialTaskMode, initialMaxHands);
+  }
+
+  private async initMainThreadFallback(
+    wantDelegate: AiEngineMode,
+    task: TrackerTaskMode,
+    numHands: MaxHandsOption,
+  ): Promise<GpuInfo> {
+    const tracker = await createMainThreadTracker(wantDelegate, task, numHands);
     if (this.disposed) {
-      tracker.landmarker.close();
+      tracker.handLandmarker?.close();
+      tracker.poseLandmarker?.close();
       return tracker.gpuInfo;
     }
-    this.fallbackLandmarker = tracker.landmarker;
-    this.fallbackCanvas = document.createElement('canvas');
-    this.fallbackCanvas.width = AI_W;
-    this.fallbackCanvas.height = AI_H;
-    this.fallbackCtx = this.fallbackCanvas.getContext('2d');
+    this.mainHandLandmarker?.close();
+    this.mainPoseLandmarker?.close();
+    this.mainHandLandmarker = tracker.handLandmarker;
+    this.mainPoseLandmarker = tracker.poseLandmarker;
+    if (!this.mainCanvas) {
+      this.mainCanvas = document.createElement('canvas');
+      this.mainCanvas.width = AI_W;
+      this.mainCanvas.height = AI_H;
+      this.mainCtx = this.mainCanvas.getContext('2d');
+    }
     this.gpuInfo = tracker.gpuInfo;
     this.activeDelegate = tracker.gpuInfo.delegate;
     this.onDelegateChangeCallback?.(this.activeDelegate);
@@ -102,6 +129,8 @@ export class HandTrackerClient {
     this.engineMode = mode;
     if (this.worker && !this.disposed) {
       this.worker.postMessage({ type: 'SET_ENGINE', engineMode: mode });
+    } else if (!this.disposed) {
+      void this.initMainThreadFallback(mode, this.taskMode, this.maxHands);
     }
   }
 
@@ -110,12 +139,25 @@ export class HandTrackerClient {
     this.taskMode = mode;
     if (this.worker && !this.disposed) {
       this.worker.postMessage({ type: 'SET_TASK_MODE', taskMode: mode });
+    } else if (!this.disposed) {
+      void this.initMainThreadFallback(this.engineMode, mode, this.maxHands);
+    }
+  }
+
+  public setMaxHands(maxHands: MaxHandsOption): void {
+    if (this.maxHands === maxHands) return;
+    this.maxHands = maxHands;
+    if (this.worker && !this.disposed) {
+      this.worker.postMessage({ type: 'SET_MAX_HANDS', maxHands });
+    } else if (!this.disposed && this.taskMode === 'HAND') {
+      void this.initMainThreadFallback(this.engineMode, 'HAND', maxHands);
     }
   }
 
   public getTelemetry(): {
     isWorker: boolean;
     taskMode: TrackerTaskMode;
+    maxHands: MaxHandsOption;
     delegate: 'GPU' | 'CPU';
     avgInferMs: number;
     aiFps: number;
@@ -123,6 +165,7 @@ export class HandTrackerClient {
     return {
       isWorker: this.worker !== null,
       taskMode: this.taskMode,
+      maxHands: this.maxHands,
       delegate: this.activeDelegate,
       avgInferMs: Math.round(this.avgInferMs * 10) / 10,
       aiFps: this.computeAiFps(),
@@ -136,7 +179,7 @@ export class HandTrackerClient {
       this.completionCount += 1;
     }
     if (inferMs > 0) {
-      this.avgInferMs = this.avgInferMs > 0 ? this.avgInferMs * 0.85 + inferMs * 0.15 : inferMs;
+      this.avgInferMs = this.avgInferMs > 0 ? this.avgInferMs * 0.82 + inferMs * 0.18 : inferMs;
     }
     return this.computeAiFps();
   }
@@ -194,6 +237,7 @@ export class HandTrackerClient {
   private initWorker(
     initialMode: AiEngineMode,
     initialTask: TrackerTaskMode,
+    initialMaxHands: MaxHandsOption,
   ): Promise<GpuInfo> {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL('../workers/handTracker.worker.ts', import.meta.url), {
@@ -219,8 +263,13 @@ export class HandTrackerClient {
           resolve(msg.gpuInfo as GpuInfo);
           return;
         }
+        if (msg.type === 'GPU_UNAVAILABLE') {
+          window.clearTimeout(timeoutId);
+          reject(new Error(String(msg.message || 'Worker GPU delegate unavailable')));
+          return;
+        }
         if (msg.type === 'DELEGATE_CHANGED') {
-          this.activeDelegate = (msg.delegate ?? 'CPU') as 'GPU' | 'CPU';
+          this.activeDelegate = (msg.delegate ?? 'GPU') as 'GPU' | 'CPU';
           this.onDelegateChangeCallback?.(this.activeDelegate);
           return;
         }
@@ -240,6 +289,9 @@ export class HandTrackerClient {
           const inferMs = Number(msg.inferMs ?? 0);
           const delegate = (msg.delegate ?? this.activeDelegate) as 'GPU' | 'CPU';
           const pktTask = (msg.taskMode ?? this.taskMode) as TrackerTaskMode;
+          const landmarks = (msg.landmarks ?? []) as Landmark3D[][];
+          const poseLandmarks = (msg.poseLandmarks ?? null) as Landmark3D[] | null;
+
           this.activeDelegate = delegate;
           const aiFps = this.recordCompletion(now, inferMs);
 
@@ -247,16 +299,22 @@ export class HandTrackerClient {
 
           this.onResultCallback?.({
             taskMode: pktTask,
-            landmarks: (msg.landmarks ?? []) as Landmark3D[][],
-            poseLandmarks: (msg.poseLandmarks ?? null) as Landmark3D[] | null,
+            landmarks,
+            poseLandmarks,
             aiFps,
             inferMs,
+            avgInferMs: Math.round(this.avgInferMs * 10) / 10,
             delegate,
           });
         }
       };
 
-      worker.postMessage({ type: 'INIT', engineMode: initialMode, taskMode: initialTask });
+      worker.postMessage({
+        type: 'INIT',
+        engineMode: initialMode,
+        taskMode: initialTask,
+        maxHands: initialMaxHands,
+      });
     });
   }
 
@@ -299,29 +357,42 @@ export class HandTrackerClient {
       return;
     }
 
-    if (this.fallbackLandmarker && this.fallbackCanvas && this.fallbackCtx && !this.isProcessing) {
+    const activeMainModel =
+      this.taskMode === 'POSE' ? this.mainPoseLandmarker : this.mainHandLandmarker;
+    if (activeMainModel && this.mainCanvas && this.mainCtx && !this.isProcessing) {
       this.isProcessing = true;
       window.setTimeout(() => {
-        if (this.disposed || !this.fallbackLandmarker || !this.fallbackCanvas || !this.fallbackCtx) {
+        if (this.disposed || !this.mainCanvas || !this.mainCtx) {
           this.isProcessing = false;
           return;
         }
         try {
-          this.fallbackCtx.drawImage(video, 0, 0, AI_W, AI_H);
-          const now = performance.now();
-          const ts = Math.max(this.lastDetectTs + 1, Math.round(now));
+          this.mainCtx.drawImage(video, 0, 0, AI_W, AI_H);
+          const doneNow = performance.now();
+          const ts = Math.max(this.lastDetectTs + 1, Math.round(doneNow));
           this.lastDetectTs = ts;
           const t0 = performance.now();
-          const result = this.fallbackLandmarker.detectForVideo(this.fallbackCanvas, ts);
+          let landmarks: Landmark3D[][] = [];
+          let poseLandmarks: Landmark3D[] | null = null;
+
+          if (this.taskMode === 'POSE' && this.mainPoseLandmarker) {
+            const res = this.mainPoseLandmarker.detectForVideo(this.mainCanvas, ts);
+            poseLandmarks = (res.landmarks?.[0] ?? null) as Landmark3D[] | null;
+          } else if (this.mainHandLandmarker) {
+            const res = this.mainHandLandmarker.detectForVideo(this.mainCanvas, ts);
+            landmarks = (res.landmarks ?? []) as Landmark3D[][];
+          }
+
           const inferMs = performance.now() - t0;
-          const aiFps = this.recordCompletion(now, inferMs);
+          const aiFps = this.recordCompletion(doneNow, inferMs);
 
           this.onResultCallback?.({
-            taskMode: 'HAND',
-            landmarks: (result.landmarks ?? []) as Landmark3D[][],
-            poseLandmarks: null,
+            taskMode: this.taskMode,
+            landmarks,
+            poseLandmarks,
             aiFps,
             inferMs,
+            avgInferMs: Math.round(this.avgInferMs * 10) / 10,
             delegate: this.activeDelegate,
           });
         } finally {
@@ -345,9 +416,13 @@ export class HandTrackerClient {
       this.worker.terminate();
       this.worker = null;
     }
-    if (this.fallbackLandmarker) {
-      this.fallbackLandmarker.close();
-      this.fallbackLandmarker = null;
+    if (this.mainHandLandmarker) {
+      this.mainHandLandmarker.close();
+      this.mainHandLandmarker = null;
+    }
+    if (this.mainPoseLandmarker) {
+      this.mainPoseLandmarker.close();
+      this.mainPoseLandmarker = null;
     }
   }
 }

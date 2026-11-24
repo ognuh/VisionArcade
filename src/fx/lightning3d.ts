@@ -8,7 +8,7 @@ const VERTS_PER_RIBBON = PTS_PER_RIBBON * 2;
 const TRIS_PER_RIBBON = (PTS_PER_RIBBON - 1) * 2;
 const TOTAL_VERTS = MAX_RIBBONS * VERTS_PER_RIBBON;
 const TOTAL_INDICES = MAX_RIBBONS * TRIS_PER_RIBBON * 3;
-const SPARK_POOL = 260;
+const SPARK_POOL = 320;
 const FINGERTIP_IDS = [4, 8, 12, 16, 20];
 
 // Continuous 2D gradient noise for smooth organic time-evolving Catmull-Rom spline displacement
@@ -768,7 +768,7 @@ export class Lightning3DEngine {
           this.burstWorldX = wP.x;
           this.burstWorldY = wP.y;
           this.edgeFlashAlpha = 0.85 + this.chargeLevel * 0.25;
-          for (let s = 0; s < 120; s += 1) {
+          for (let s = 0; s < 100; s += 1) {
             this.spawnSpark3D(wP.x, wP.y, 1.65 + this.chargeLevel * 0.72);
           }
           this.audio.playThunderDischarge(0.8 + this.chargeLevel * 0.5);

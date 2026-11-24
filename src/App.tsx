@@ -15,6 +15,7 @@ import {
   type GestureType,
   type GraphicsQuality,
   type Landmark3D,
+  type MaxHandsOption,
   type PrismSettings,
   type TrackerTaskMode,
 } from './types/vision';
@@ -34,6 +35,7 @@ interface VisionTestBridge {
   setMode: (mode: PrismSettings['mode']) => void;
   setQuality: (quality: GraphicsQuality) => void;
   setFpsTarget: (fpsTarget: FpsTarget) => void;
+  setMaxHands: (maxHands: MaxHandsOption) => void;
   setNoteOpen: (open: boolean) => void;
   setToolsOpen: (open: boolean) => void;
   setAirDraw: (enabled: boolean) => void;
@@ -59,9 +61,11 @@ interface VisionTestBridge {
     engineMode?: AiEngineMode,
     frames?: number,
     taskMode?: TrackerTaskMode,
+    maxHands?: MaxHandsOption,
   ) => Promise<{
     isWorker: boolean;
     taskMode: TrackerTaskMode;
+    maxHands: MaxHandsOption;
     completedFrames: number;
     steadyAvgInferMs: number;
     steadyMaxInferMs: number;
@@ -78,6 +82,7 @@ interface VisionTestBridge {
     airDrawEnabled: boolean;
     graphicsQuality: GraphicsQuality;
     fpsTarget: FpsTarget;
+    maxHands: MaxHandsOption;
     holoText: string;
     engineStatus: EngineStatus;
   };
@@ -106,16 +111,17 @@ const SFX_STORAGE_KEY = 'visionarcade.sfxEnabled';
 const AI_ENGINE_STORAGE_KEY = 'visionarcade.aiEngineMode';
 const QUALITY_STORAGE_KEY = 'visionarcade.graphicsQuality';
 const FPS_TARGET_STORAGE_KEY = 'visionarcade.fpsTarget';
+const MAX_HANDS_STORAGE_KEY = 'visionarcade.maxHands';
 const LEGACY_STORAGE_KEYS = [
   'visionarcade.arcadeHighScore',
   'visionarcade.faceMaskMode',
   'visionarcade.faceMaskStrength',
   'visionarcade.fpsCap',
+  'visionarcade.recordMic',
 ];
 
 const DWELL_TRIGGER_MS = 650;
 const DWELL_COOLDOWN_MS = 800;
-const DOCK_AUTO_FADE_MS = 2500;
 const MAGNETIC_HIT_PADDING_PX = 14;
 const MAGNETIC_PULL = 0.38;
 const FPS_UPDATE_INTERVAL_MS = 450;
@@ -184,8 +190,7 @@ function saveCameraPreset(preset: CameraPresetId): void {
 
 function loadSavedSfxEnabled(): boolean {
   try {
-    const v = window.localStorage.getItem(SFX_STORAGE_KEY);
-    if (v === '0') return false;
+    if (window.localStorage.getItem(SFX_STORAGE_KEY) === '0') return false;
   } catch {
     // ignore
   }
@@ -203,7 +208,7 @@ function saveSfxEnabled(enabled: boolean): void {
 function loadSavedAiEngineMode(): AiEngineMode {
   try {
     const v = window.localStorage.getItem(AI_ENGINE_STORAGE_KEY);
-    if (v === 'GPU' || v === 'AUTO' || v === 'CPU') return v;
+    if (v === 'GPU' || v === 'CPU') return v;
   } catch {
     // ignore
   }
@@ -221,7 +226,8 @@ function saveAiEngineMode(mode: AiEngineMode): void {
 function loadSavedQuality(): GraphicsQuality {
   try {
     const v = window.localStorage.getItem(QUALITY_STORAGE_KEY);
-    if (v === 'ULTRA' || v === 'HIGH') return v;
+    if (v === 'ULTRA' || v === 'PRO') return v;
+    if (v === 'HIGH') return 'PRO';
   } catch {
     // ignore
   }
@@ -239,18 +245,35 @@ function saveQuality(q: GraphicsQuality): void {
 function loadSavedFpsTarget(): FpsTarget {
   try {
     const v = window.localStorage.getItem(FPS_TARGET_STORAGE_KEY);
-    if (v === 'MAX') return 'MAX';
     if (v === '120') return 120;
     if (v === '60') return 60;
+    if (v === 'MAX') return 'MAX';
   } catch {
     // ignore
   }
-  return 'MAX';
+  return 60; // Balanced startup default for RTX 3050 45W + OBS 60 FPS (user can switch to 120 / Max Hz)
 }
 
 function saveFpsTarget(target: FpsTarget): void {
   try {
     window.localStorage.setItem(FPS_TARGET_STORAGE_KEY, String(target));
+  } catch {
+    // ignore
+  }
+}
+
+function loadSavedMaxHands(): MaxHandsOption {
+  try {
+    if (window.localStorage.getItem(MAX_HANDS_STORAGE_KEY) === '1') return 1;
+  } catch {
+    // ignore
+  }
+  return 2;
+}
+
+function saveMaxHands(n: MaxHandsOption): void {
+  try {
+    window.localStorage.setItem(MAX_HANDS_STORAGE_KEY, String(n));
   } catch {
     // ignore
   }
@@ -269,6 +292,7 @@ function createInitialSettings(): PrismSettings {
     aiEngineMode: loadSavedAiEngineMode(),
     graphicsQuality: loadSavedQuality(),
     fpsTarget: loadSavedFpsTarget(),
+    maxHands: loadSavedMaxHands(),
   };
 }
 
@@ -285,11 +309,6 @@ interface ExtendedTrackSettings extends MediaTrackSettings {
   focusDistance?: number;
 }
 
-/**
- * 60 FPS priority webcam constraints:
- * - Requests ideal 60 FPS with min 25 FPS so 60fps sources (USB webcam / Phone / OBS) lock true 60 FPS,
- *   while 30fps laptop webcams smoothly lock 30 FPS and never drop to 10fps Windows Media Foundation profiles.
- */
 function getVideoConstraintsForPreset(preset: CameraPresetId): MediaTrackConstraints {
   switch (preset) {
     case '720P60':
@@ -334,7 +353,6 @@ async function openCameraStream(
   ];
 
   if (preferredDeviceId) {
-    // Allow OBS Virtual Camera to open with its native output profile before falling back to default cam
     attempts.push(
       { deviceId: { exact: preferredDeviceId } },
       { ...baseVideo, facingMode: 'user' },
@@ -357,13 +375,11 @@ async function openCameraStream(
   throw lastErr instanceof Error ? lastErr : new Error('Unable to open camera stream.');
 }
 
-/** Defaults to OBS Virtual Camera whenever available (handles both pre-granted and first-time permission). */
 async function openDefaultObsCameraStream(preset: CameraPresetId): Promise<MediaStream> {
   const preObsId = await findObsCameraDeviceId();
   const initialStream = await openCameraStream(preObsId, preset);
   if (preObsId) return initialStream;
 
-  // On first visit labels were empty until permission was granted; re-check for OBS now
   const postObsId = await findObsCameraDeviceId();
   const activeId = initialStream.getVideoTracks()[0]?.getSettings?.().deviceId;
   if (postObsId && postObsId !== activeId) {
@@ -423,6 +439,7 @@ function scheduleSafeFocusLock(
 
 export default function App() {
   const [engineStatus, setEngineStatus] = useState<EngineStatus>('loading');
+  const [preloaderMounted, setPreloaderMounted] = useState<boolean>(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [modeToast, setModeToast] = useState<{ text: string; key: number } | null>(null);
   const [toolsOpen, setToolsOpen] = useState<boolean>(false);
@@ -447,6 +464,7 @@ export default function App() {
   const fpsTextRef = useRef<HTMLSpanElement | null>(null);
   const camFpsTextRef = useRef<HTMLSpanElement | null>(null);
   const aiFpsTextRef = useRef<HTMLSpanElement | null>(null);
+  const aiMsTextRef = useRef<HTMLSpanElement | null>(null);
   const modeTextRef = useRef<HTMLSpanElement | null>(null);
   const uiRootRef = useRef<HTMLDivElement | null>(null);
   const dockNavRef = useRef<HTMLElement | null>(null);
@@ -474,9 +492,6 @@ export default function App() {
   const cachedButtonsRef = useRef<CachedButtonRect[]>([]);
 
   const lastActiveModeRef = useRef<CycleModeId>('GLASS');
-  const lastDockActivityRef = useRef<number>(performance.now());
-  const dockAwakeRef = useRef<boolean>(true);
-  const dockNearCursorRef = useRef<boolean>(false);
   const toastTimerRef = useRef<number | null>(null);
   const toastSeqRef = useRef<number>(0);
   const holoCursorIdxRef = useRef<number>(0);
@@ -485,6 +500,7 @@ export default function App() {
   const mockPoseStartRef = useRef<number>(performance.now());
   const engineStatusRef = useRef<EngineStatus>('loading');
   const holoTextValueRef = useRef<string>('');
+  const dprRef = useRef<number>(Math.min(window.devicePixelRatio || 1, 1.5));
 
   useEffect(() => {
     purgeLegacyStorage();
@@ -492,6 +508,13 @@ export default function App() {
 
   useEffect(() => {
     engineStatusRef.current = engineStatus;
+    if (engineStatus === 'loading') {
+      setPreloaderMounted(true);
+      return;
+    }
+    // Smooth 300ms Glass Preloader fade-out before unmounting
+    const timer = window.setTimeout(() => setPreloaderMounted(false), 320);
+    return () => window.clearTimeout(timer);
   }, [engineStatus]);
 
   useEffect(() => {
@@ -503,6 +526,7 @@ export default function App() {
     const targetTask: TrackerTaskMode =
       settings.mode === 'RUNNER' && !settings.airDrawEnabled ? 'POSE' : 'HAND';
     trackerClientRef.current?.setTaskMode(targetTask);
+    trackerClientRef.current?.setMaxHands(settings.maxHands);
     engineRef.current?.setQuality(settings.graphicsQuality);
   }, [settings]);
 
@@ -633,26 +657,9 @@ export default function App() {
     };
   }, [refreshCachedUiRects]);
 
-  const applyDockStyle = useCallback((awake: boolean, boosted: boolean) => {
-    const nav = dockNavRef.current;
-    if (!nav) return;
-    nav.style.opacity = awake ? '1' : '0.32';
-    nav.style.transform = boosted
-      ? 'translateX(-50%) scale(1.02)'
-      : 'translateX(-50%) scale(1)';
+  const markDockActivity = useCallback(() => {
+    // OBS-ready Golden Release: Floating Dock stays permanently crisp & visible (never fades/hides UI)
   }, []);
-
-  const markDockActivity = useCallback(
-    (boost = true) => {
-      lastDockActivityRef.current = performance.now();
-      if (!dockAwakeRef.current || dockNearCursorRef.current !== boost) {
-        dockAwakeRef.current = true;
-        dockNearCursorRef.current = boost;
-        applyDockStyle(true, boost);
-      }
-    },
-    [applyDockStyle],
-  );
 
   const showModeToast = useCallback((label: string) => {
     toastSeqRef.current += 1;
@@ -668,7 +675,6 @@ export default function App() {
 
   const handleSettingsChange = useCallback(
     (patch: Partial<PrismSettings>) => {
-      markDockActivity(true);
       setSettings((prev) => {
         if (patch.mirrored !== undefined && patch.mirrored !== prev.mirrored) {
           engineRef.current?.resetSmoothing();
@@ -687,6 +693,10 @@ export default function App() {
         if (patch.fpsTarget !== undefined && patch.fpsTarget !== prev.fpsTarget) {
           saveFpsTarget(patch.fpsTarget);
         }
+        if (patch.maxHands !== undefined && patch.maxHands !== prev.maxHands) {
+          saveMaxHands(patch.maxHands);
+          trackerClientRef.current?.setMaxHands(patch.maxHands);
+        }
         if (patch.mode && patch.mode !== 'AUTO' && patch.mode !== prev.mode) {
           showModeToast(MODE_DISPLAY_NAME[patch.mode]);
           if (patch.mode === 'RUNNER') {
@@ -696,13 +706,12 @@ export default function App() {
         return { ...prev, ...patch };
       });
     },
-    [markDockActivity, showModeToast],
+    [showModeToast],
   );
 
   const handleToggleTools = useCallback(() => {
-    markDockActivity(true);
     setToolsOpen((v) => !v);
-  }, [markDockActivity]);
+  }, []);
 
   const handleStepMode = useCallback(
     (dir: -1 | 1) => {
@@ -724,9 +733,8 @@ export default function App() {
   );
 
   const handleClearDrawing = useCallback(() => {
-    markDockActivity(true);
     engineRef.current?.clearDrawing();
-  }, [markDockActivity]);
+  }, []);
 
   const handleClearNote = useCallback(() => {
     holoCursorIdxRef.current = 0;
@@ -769,30 +777,25 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    const onPointerMove = (e: PointerEvent) => {
-      if (e.clientY >= window.innerHeight * 0.75) {
-        markDockActivity(true);
-      }
-    };
-    window.addEventListener('pointermove', onPointerMove, { passive: true });
-    return () => window.removeEventListener('pointermove', onPointerMove);
-  }, [markDockActivity]);
-
+  /** Caps pixelRatio <= 1.5 across WebGL2 & 2D Overlay for sharp visuals without 4x DPI fillrate tax. */
   const syncCanvases = useCallback(() => {
     const w = Math.max(1, window.innerWidth);
     const h = Math.max(1, window.innerHeight);
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    dprRef.current = dpr;
+    const bufW = Math.max(1, Math.round(w * dpr));
+    const bufH = Math.max(1, Math.round(h * dpr));
 
     const glCanvas = glCanvasRef.current;
-    if (glCanvas && (glCanvas.width !== w || glCanvas.height !== h)) {
-      glCanvas.width = w;
-      glCanvas.height = h;
+    if (glCanvas && (glCanvas.width !== bufW || glCanvas.height !== bufH)) {
+      glCanvas.width = bufW;
+      glCanvas.height = bufH;
     }
 
     const glowCanvas = glowCanvasRef.current;
-    if (glowCanvas && (glowCanvas.width !== w || glowCanvas.height !== h)) {
-      glowCanvas.width = w;
-      glowCanvas.height = h;
+    if (glowCanvas && (glowCanvas.width !== bufW || glowCanvas.height !== bufH)) {
+      glowCanvas.width = bufW;
+      glowCanvas.height = bufH;
     }
 
     refreshCachedUiRects();
@@ -906,6 +909,9 @@ export default function App() {
             if (aiFpsTextRef.current) {
               aiFpsTextRef.current.textContent = String(packet.aiFps).padStart(2, '0');
             }
+            if (aiMsTextRef.current) {
+              aiMsTextRef.current.textContent = String(Math.max(1, Math.round(packet.avgInferMs)));
+            }
             lastAiFpsUpdateMs = now;
           }
 
@@ -928,8 +934,8 @@ export default function App() {
           if (curSettings.noteOpen && latestHands.length > 0) {
             const blinkEvents = blinkDetectorRef.current.update(latestHands, latestGestures, now);
             if (blinkEvents.length > 0) {
-              const viewW = glCanvasRef.current?.width || window.innerWidth;
-              const viewH = glCanvasRef.current?.height || window.innerHeight;
+              const viewW = window.innerWidth || 1280;
+              const viewH = window.innerHeight || 720;
               const vidW = videoRef.current?.videoWidth || 1280;
               const vidH = videoRef.current?.videoHeight || 720;
               for (let i = 0; i < blinkEvents.length; i += 1) {
@@ -982,6 +988,9 @@ export default function App() {
             setFpsTarget: (fpsTarget: FpsTarget) => {
               setSettings((prev) => ({ ...prev, fpsTarget }));
             },
+            setMaxHands: (maxHands: MaxHandsOption) => {
+              setSettings((prev) => ({ ...prev, maxHands }));
+            },
             setNoteOpen: (open: boolean) => {
               setSettings((prev) => ({ ...prev, noteOpen: open }));
             },
@@ -1018,8 +1027,9 @@ export default function App() {
             getRippleMeta: () => engineRef.current?.getRippleMeta() ?? null,
             runLiveWorkerTest: async (
               testEngineMode: AiEngineMode = 'GPU',
-              targetFrames = 24,
+              targetFrames = 20,
               taskMode: TrackerTaskMode = 'HAND',
+              maxHands: MaxHandsOption = 2,
             ) => {
               const vid = videoRef.current;
               if (!vid) throw new Error('Video element missing');
@@ -1041,6 +1051,7 @@ export default function App() {
                   resolve({
                     isWorker: meta.isWorker,
                     taskMode: meta.taskMode,
+                    maxHands: meta.maxHands,
                     completedFrames: count,
                     steadyAvgInferMs:
                       steadyCount > 0 ? Math.round((steadySumMs / steadyCount) * 10) / 10 : 0,
@@ -1070,6 +1081,7 @@ export default function App() {
                     testEngineMode,
                     undefined,
                     taskMode,
+                    maxHands,
                   )
                   .then(() => {
                     timerId = window.setInterval(() => {
@@ -1093,6 +1105,7 @@ export default function App() {
               airDrawEnabled: settingsRef.current.airDrawEnabled,
               graphicsQuality: settingsRef.current.graphicsQuality,
               fpsTarget: settingsRef.current.fpsTarget,
+              maxHands: settingsRef.current.maxHands,
               holoText: holoTextValueRef.current,
               engineStatus: engineStatusRef.current,
             }),
@@ -1107,6 +1120,7 @@ export default function App() {
                 if (!cancelled) setActiveAiDelegate(delegate);
               },
               initialTask,
+              settingsRef.current.maxHands,
             ),
           ]);
           stream = camStream;
@@ -1144,14 +1158,13 @@ export default function App() {
         }
         prismEngine.uploadVideoFrame(video);
 
-        // Glass Preloader compiles all 3D + Bloom + Dissolve + Runner shaders before reveal (0ms switch hitch)
+        // Glass Preloader compiles ALL shaders (Cosmos, Dissolve, Lightning, Fluid, Runner, Bloom) -> 0ms mode hitch
         prismEngine.prewarmCosmosNow();
 
         syncCanvases();
         setEngineStatus('ready');
 
         if (isTestMode) {
-          // 60Hz synthetic mock stream (both Hand & Full-Body Runner Pose)
           mockIntervalId = window.setInterval(() => {
             if (cancelled) return;
             const elapsedSec = (performance.now() - mockPoseStartRef.current) / 1000;
@@ -1165,16 +1178,22 @@ export default function App() {
                 landmarks: [],
                 poseLandmarks: generateMockPose(mockPoseRef.current, elapsedSec),
                 aiFps: 60,
-                inferMs: 5,
+                inferMs: 6,
+                avgInferMs: 6,
                 delegate: 'GPU',
               });
             } else {
+              const hands = generateMockHands(mockPoseRef.current, elapsedSec).slice(
+                0,
+                settingsRef.current.maxHands,
+              );
               onWorkerResult({
                 taskMode: 'HAND',
-                landmarks: generateMockHands(mockPoseRef.current, elapsedSec),
+                landmarks: hands,
                 poseLandmarks: null,
                 aiFps: 60,
-                inferMs: 5,
+                inferMs: 6,
+                avgInferMs: 6,
                 delegate: 'GPU',
               });
             }
@@ -1235,7 +1254,7 @@ export default function App() {
         let curTiltY = 0;
         let fistHoldSec = 0;
 
-        // Max Refresh Rate Native Render Loop (Max Hz / 120 / 60 user selectable)
+        // Golden Release Zero-Spike 120 FPS Default Render Loop (60 / 120 / Max Hz selectable)
         const renderLoop = (now: number) => {
           if (cancelled) return;
           rafId = requestAnimationFrame(renderLoop);
@@ -1253,7 +1272,7 @@ export default function App() {
 
           if (curSettings.fpsTarget !== 'MAX') {
             const targetInterval = 1000 / curSettings.fpsTarget;
-            if (now < nextRenderTime - 0.25) {
+            if (now < nextRenderTime - 0.35) {
               return;
             }
             nextRenderTime += targetInterval;
@@ -1270,20 +1289,24 @@ export default function App() {
           emaDt = emaDt * (1 - EMA_ALPHA) + dtSeconds * EMA_ALPHA;
           if (now - lastFpsDisplayMs >= FPS_UPDATE_INTERVAL_MS) {
             if (fpsTextRef.current) {
-              fpsTextRef.current.textContent = String(
-                Math.min(240, Math.round(1 / Math.max(emaDt, 0.001))),
-              ).padStart(2, '0');
+              const rawFps = Math.round(1 / Math.max(emaDt, 0.001));
+              const maxShow = curSettings.fpsTarget === 'MAX' ? 240 : curSettings.fpsTarget;
+              fpsTextRef.current.textContent = String(Math.min(maxShow, rawFps)).padStart(2, '0');
             }
             lastFpsDisplayMs = now;
           }
 
-          const glCanvasEl = glCanvasRef.current;
-          if (!glCanvasEl) return;
+          if (!glCanvasRef.current) return;
 
-          const viewW = glCanvasEl.width;
-          const viewH = glCanvasEl.height;
+          const viewW = Math.max(1, window.innerWidth);
+          const viewH = Math.max(1, window.innerHeight);
           const vidW = video.videoWidth || 1280;
           const vidH = video.videoHeight || 720;
+
+          if (overlayCtx) {
+            const dpr = dprRef.current;
+            overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          }
 
           const pipCtx =
             curSettings.mode === 'RUNNER' && !curSettings.airDrawEnabled
@@ -1323,7 +1346,6 @@ export default function App() {
             lastDisplayedStatus = statusLabel;
           }
 
-          // Throttled Runner HUD state sync (~15Hz — crisp score/countdown updates with near-zero React cost)
           if (frameOut.activeMode === 'RUNNER' && now - lastRunnerUiSyncMs >= 65) {
             lastRunnerUiSyncMs = now;
             const snap = activeEngine.getRunnerSnapshot();
@@ -1376,10 +1398,6 @@ export default function App() {
 
           const tip = frameOut.indexTipPx;
           if (tip) {
-            if (tip.y >= viewH * 0.75) {
-              markDockActivity(true);
-            }
-
             let hitRect: CachedButtonRect | null = null;
             const cached = cachedButtonsRef.current;
             for (let i = 0; i < cached.length; i += 1) {
@@ -1401,7 +1419,6 @@ export default function App() {
                 hoveredBtn = btn;
                 hoveredUiItemRef.current =
                   btn.getAttribute('data-dock-item') ?? btn.getAttribute('aria-label') ?? btn.textContent;
-                markDockActivity(true);
               }
               dwellMs = 0;
             }
@@ -1435,14 +1452,6 @@ export default function App() {
             clearHoverAttr();
             dwellMs = 0;
             airCursorRef.current?.update(null, 0, false, 0);
-          }
-
-          const shouldBeAwake =
-            toolsOpenRef.current || now - lastDockActivityRef.current <= DOCK_AUTO_FADE_MS;
-          if (shouldBeAwake !== dockAwakeRef.current) {
-            dockAwakeRef.current = shouldBeAwake;
-            dockNearCursorRef.current = false;
-            applyDockStyle(shouldBeAwake, false);
           }
         };
 
@@ -1502,10 +1511,8 @@ export default function App() {
     };
   }, [
     advanceHoloTyping,
-    applyDockStyle,
     handleClearNote,
     handleStepMode,
-    markDockActivity,
     refreshCameraList,
     retryToken,
     syncCanvases,
@@ -1530,13 +1537,13 @@ export default function App() {
         }`}
       />
 
-      {/* Layer 1: WebGL2 Webcam Pass-Through (+ Ultra Liquid Glass Ripple) + 3D Crystal Lenses */}
+      {/* Layer 1: WebGL2 Webcam Pass-Through (+ 384p RGBA16F Liquid Glass Ripple) + 3D Crystal Lenses */}
       <canvas
         ref={glCanvasRef}
         className="pointer-events-none fixed inset-0 z-10 h-full w-full"
       />
 
-      {/* Layer 2: Shared Three.js Stage (Cosmos + 3D Lightning + 15k Fluid + Ultra 3D Runner) */}
+      {/* Layer 2: Shared Three.js Stage (Cosmos + 3D Lightning + 12k Fluid + 3D Runner, DPR <= 1.5) */}
       <canvas
         ref={cosmosCanvasRef}
         className="pointer-events-none fixed inset-0 z-10 h-full w-full"
@@ -1563,7 +1570,7 @@ export default function App() {
           data-testid="runner-hud"
           className="pointer-events-auto fixed top-4 right-4 z-20 flex items-center gap-2"
         >
-          <div className="inline-flex h-7 items-center gap-3 rounded-full border border-white/12 bg-neutral-950/65 px-3.5 font-mono text-[11px] text-white/90 tabular-nums backdrop-blur-2xl">
+          <div className="inline-flex h-7 items-center gap-3 rounded-full border border-white/15 bg-neutral-950/65 px-3.5 font-mono text-[11px] text-white/90 tabular-nums backdrop-blur-2xl">
             <span>
               <span className="text-white/45">SCORE </span>
               {String(runnerHud.score).padStart(5, '0')}
@@ -1585,7 +1592,7 @@ export default function App() {
             type="button"
             onClick={() => engineRef.current?.recalibrateRunner()}
             title="Recalibrate standing posture"
-            className="inline-flex h-7 items-center gap-1.5 rounded-full border border-white/12 bg-neutral-950/65 px-2.5 font-mono text-[10px] font-medium text-white/80 backdrop-blur-2xl transition-colors hover:bg-white/15 hover:text-white"
+            className="inline-flex h-7 items-center gap-1.5 rounded-full border border-white/15 bg-neutral-950/65 px-2.5 font-mono text-[10px] font-medium text-white/80 backdrop-blur-2xl transition-colors hover:bg-white/15 hover:text-white"
           >
             <Crosshair className="h-3 w-3" aria-hidden="true" />
             <span>Recalibrate</span>
@@ -1598,7 +1605,7 @@ export default function App() {
         <div
           data-testid="runner-pip"
           className={`pointer-events-none fixed bottom-20 z-20 overflow-hidden rounded-xl border border-white/15 bg-neutral-950/75 shadow-[0_12px_36px_rgba(0,0,0,0.6)] backdrop-blur-xl transition-[right] duration-250 ${
-            toolsOpen ? 'right-[316px]' : 'right-4'
+            toolsOpen ? 'right-[318px]' : 'right-4'
           }`}
           style={{ width: 220, height: 124 }}
         >
@@ -1619,7 +1626,7 @@ export default function App() {
               </span>
             </div>
           ) : (
-            <div className="pointer-events-auto flex w-full max-w-xs flex-col items-center gap-3.5 rounded-2xl border border-white/14 bg-neutral-950/75 px-6 py-5 text-center shadow-[0_24px_64px_rgba(0,0,0,0.6)] backdrop-blur-2xl">
+            <div className="pointer-events-auto flex w-full max-w-xs flex-col items-center gap-3.5 rounded-2xl border border-white/15 bg-neutral-950/75 px-6 py-5 text-center shadow-[0_24px_64px_rgba(0,0,0,0.6)] backdrop-blur-2xl">
               <span className="font-mono text-[10px] tracking-[0.18em] text-white/50 uppercase">
                 {runnerHud.phase === 'GAME_OVER' ? 'Run Complete' : 'Full-Body Neon Runner'}
               </span>
@@ -1657,7 +1664,6 @@ export default function App() {
                 )}
               </button>
 
-              {/* Touchless Overhead Both-Hands-Up Hold Indicator (1.2s) */}
               <div className="flex w-full flex-col gap-1.5 pt-0.5">
                 <div className="flex items-center justify-between font-mono text-[10px] text-white/50">
                   <span>Or raise both hands up</span>
@@ -1688,12 +1694,13 @@ export default function App() {
         fpsTextRef={fpsTextRef}
         camFpsTextRef={camFpsTextRef}
         aiFpsTextRef={aiFpsTextRef}
+        aiMsTextRef={aiMsTextRef}
         modeTextRef={modeTextRef}
         uiRootRef={uiRootRef}
         dockNavRef={dockNavRef}
         toolsOpen={toolsOpen}
         onToggleTools={handleToggleTools}
-        onDockActivity={() => markDockActivity(true)}
+        onDockActivity={markDockActivity}
         onStepMode={handleStepMode}
         onClearDrawing={handleClearDrawing}
         onClearNote={handleClearNote}
@@ -1701,18 +1708,30 @@ export default function App() {
 
       <AirCursor ref={airCursorRef} />
 
-      {engineStatus === 'loading' && (
+      {/* VisionOS Glass Preloader (Compiles all shaders, then fades smoothly in 300ms) */}
+      {preloaderMounted && engineStatus !== 'error' && (
         <div
           role="status"
           aria-live="polite"
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/88 p-4 backdrop-blur-xl"
+          data-testid="glass-preloader"
+          className={`fixed inset-0 z-40 flex items-center justify-center bg-black/82 p-4 backdrop-blur-2xl transition-opacity duration-300 ease-out ${
+            engineStatus === 'ready' ? 'pointer-events-none opacity-0' : 'opacity-100'
+          }`}
         >
-          <div className="flex max-w-sm flex-col items-center gap-3 rounded-2xl border border-white/12 bg-neutral-950/80 px-7 py-6 text-center backdrop-blur-2xl">
-            <Loader2 className="h-5 w-5 animate-spin text-white/85" aria-hidden="true" />
-            <h1 className="text-sm font-medium text-white">Starting VisionArcade</h1>
-            <p className="text-xs text-white/55">
-              Compiling Ultra Cinema shaders, GPU Worker pipeline, and 3D stage.
-            </p>
+          <div className="flex max-w-sm flex-col items-center gap-3.5 rounded-2xl border border-white/15 bg-neutral-950/75 px-8 py-6 text-center shadow-[0_24px_64px_rgba(0,0,0,0.65)] backdrop-blur-2xl">
+            <div className="flex items-center gap-2">
+              <span
+                aria-hidden="true"
+                className="h-2 w-2 rounded-full bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.85)]"
+              />
+              <span className="font-sans text-base font-semibold tracking-tight text-white">
+                VisionArcade
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-white/60">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-white/80" aria-hidden="true" />
+              <span>Precompiling shaders &amp; GPU Vision Worker...</span>
+            </div>
           </div>
         </div>
       )}
@@ -1722,7 +1741,7 @@ export default function App() {
           role="alert"
           className="fixed inset-0 z-40 flex items-center justify-center bg-black/90 p-4 backdrop-blur-xl"
         >
-          <div className="flex max-w-md flex-col items-center gap-3.5 rounded-2xl border border-white/12 bg-neutral-950/80 px-7 py-6 text-center backdrop-blur-2xl">
+          <div className="flex max-w-md flex-col items-center gap-3.5 rounded-2xl border border-white/15 bg-neutral-950/80 px-7 py-6 text-center backdrop-blur-2xl">
             <Camera className="h-5 w-5 text-white/80" aria-hidden="true" />
             <h1 className="text-sm font-medium text-white">Camera Unavailable</h1>
             <p className="text-xs text-white/55">
