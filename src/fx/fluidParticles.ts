@@ -1,7 +1,9 @@
 import * as THREE from 'three';
+import type { GraphicsQuality } from '../types/vision';
 import type { HandPose2D } from './types';
 
-const PARTICLE_COUNT = 8000;
+const MAX_PARTICLES = 15000;
+const HIGH_PARTICLES = 9000;
 const PINCH_NORM_THRESHOLD = 0.055;
 const PINCH_BURST_HOLD_SEC = 0.12;
 const SUPERNOVA_COOLDOWN_SEC = 0.65;
@@ -10,11 +12,14 @@ const FLUID_VERT = `
 attribute float aSpeed;
 attribute float aSize;
 attribute float aSeed;
+attribute vec2 aVel;
 
 uniform float uOpacity;
 varying float vSpeed;
 varying float vSeed;
 varying float vOpacity;
+varying vec2 vVelDir;
+varying float vStretch;
 
 void main() {
   vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
@@ -22,8 +27,15 @@ void main() {
   vSpeed = aSpeed;
   vSeed = aSeed;
   vOpacity = uOpacity;
-  float speedBoost = 1.0 + clamp(aSpeed, 0.0, 1.2) * 0.55;
-  gl_PointSize = clamp(aSize * speedBoost * (11.2 / max(-mvPos.z, 1.0)), 1.6, 11.5);
+
+  // Screen-space velocity direction for Velocity Motion-Stretch meteor streaks
+  vec2 vScreen = vec2(aVel.x, -aVel.y);
+  float vLen = length(vScreen);
+  vVelDir = vLen > 0.05 ? (vScreen / vLen) : vec2(1.0, 0.0);
+  vStretch = 1.0 + smoothstep(0.14, 1.0, aSpeed) * 3.6;
+
+  float sizeBoost = 1.0 + smoothstep(0.10, 1.0, aSpeed) * 1.45;
+  gl_PointSize = clamp(aSize * sizeBoost * (11.5 / max(-mvPos.z, 1.0)), 1.8, 22.0);
 }
 `;
 
@@ -31,32 +43,42 @@ const FLUID_FRAG = `
 varying float vSpeed;
 varying float vSeed;
 varying float vOpacity;
+varying vec2 vVelDir;
+varying float vStretch;
 
 void main() {
   if (vOpacity <= 0.005) discard;
-  float dist = length(gl_PointCoord - 0.5);
-  if (dist > 0.5) discard;
+  vec2 p = gl_PointCoord - 0.5;
 
-  // Soft glowing orb with luminous pinpoint core
-  float halo = exp(-dist * dist * 11.0);
-  float core = exp(-dist * dist * 34.0);
+  // Anisotropic velocity-aligned coordinate system: compresses width perpendicular to motion
+  vec2 perp = vec2(-vVelDir.y, vVelDir.x);
+  float along = dot(p, vVelDir);
+  float across = dot(p, perp) * vStretch;
+
+  // Slightly forward-weighted comet head with glowing tail
+  vec2 stretched = vec2(along * 1.05, across);
+  float distSq = dot(stretched, stretched);
+  if (distSq > 0.25) discard;
+
+  float halo = exp(-distSq * 14.0);
+  float core = exp(-distSq * 46.0);
 
   float s = clamp(vSpeed, 0.0, 1.0);
-  vec3 cDeepBlue = vec3(0.14, 0.30, 0.88);
-  vec3 cIndigo   = vec3(0.38, 0.22, 0.96);
-  vec3 cCyan     = vec3(0.10, 0.92, 1.24);
-  vec3 cMagenta  = vec3(1.42, 0.28, 0.92);
-  vec3 cGold     = vec3(1.52, 1.32, 0.78);
+  vec3 cDeepBlue = vec3(0.11, 0.26, 0.92);
+  vec3 cIndigo   = vec3(0.36, 0.18, 0.98);
+  vec3 cCyan     = vec3(0.08, 0.96, 1.38);
+  vec3 cMagenta  = vec3(1.52, 0.26, 0.98);
+  vec3 cGold     = vec3(1.66, 1.44, 0.86);
 
   vec3 idleCol = mix(cDeepBlue, cIndigo, vSeed);
-  vec3 fastCol = mix(cMagenta, cGold, fract(vSeed * 3.7));
+  vec3 fastCol = mix(cGold, cMagenta, smoothstep(0.35, 0.85, fract(vSeed * 3.7)));
 
-  vec3 col = mix(idleCol, cCyan, smoothstep(0.08, 0.48, s));
-  col = mix(col, fastCol, smoothstep(0.50, 0.96, s));
-  col += vec3(0.55, 0.70, 0.85) * core * (0.45 + s * 0.75);
+  vec3 col = mix(idleCol, cCyan, smoothstep(0.07, 0.44, s));
+  col = mix(col, fastCol, smoothstep(0.46, 0.94, s));
+  col += vec3(0.75, 0.86, 1.0) * core * (0.50 + s * 0.85);
 
-  float alpha = clamp((halo * 0.78 + core * 0.55) * vOpacity, 0.0, 1.0);
-  gl_FragColor = vec4(col * (0.75 + s * 0.45), alpha);
+  float alpha = clamp((halo * 0.78 + core * 0.62) * vOpacity, 0.0, 1.0);
+  gl_FragColor = vec4(col * (0.78 + s * 0.52), alpha);
 }
 `;
 
@@ -95,28 +117,28 @@ function countExtendedFingers2D(h: HandPose2D): number {
 }
 
 /**
- * 8,000-Particle Zero-GC Fluid Physics Sandbox (Three.js Points + Shared UnrealBloomPass):
- * - Velocity-mapped HDR color ramp (Deep Blue/Indigo -> Electric Cyan -> White-Gold/Magenta)
- * - Ambient curl-field drift when idle
- * - Independent 2-hand physics:
- *   1) Gentle hand sweep: directional wake + fluid swirl
- *   2) Pinch (thumb 4 & index 8 < 0.055): Gravitational Vortex spiral
- *   3) Open Palm (>= 4 fingers): Radial Repulsion + Pinch->Open Supernova Burst!
+ * Ultra 15,000-Particle Zero-GC GPU Fluid Sandbox (Three.js Points + Shared Half-Res UnrealBloomPass):
+ * - Velocity Motion-Stretch shader turns fast sweeps & Supernova Bursts into shooting-star meteor streaks
+ * - Velocity-mapped HDR palette: Deep Blue -> Electric Cyan -> White-Gold / Magenta
+ * - Ambient divergence-free curl-noise drift + independent 2-hand Vortex / Repulse / Supernova physics
  */
 export class FluidParticleSandbox {
   public readonly root = new THREE.Group();
 
-  private px = new Float32Array(PARTICLE_COUNT);
-  private py = new Float32Array(PARTICLE_COUNT);
-  private vx = new Float32Array(PARTICLE_COUNT);
-  private vy = new Float32Array(PARTICLE_COUNT);
-  private seeds = new Float32Array(PARTICLE_COUNT);
+  private activeCount = MAX_PARTICLES;
+  private px = new Float32Array(MAX_PARTICLES);
+  private py = new Float32Array(MAX_PARTICLES);
+  private vx = new Float32Array(MAX_PARTICLES);
+  private vy = new Float32Array(MAX_PARTICLES);
+  private seeds = new Float32Array(MAX_PARTICLES);
 
-  private posBuf = new Float32Array(PARTICLE_COUNT * 3);
-  private speedBuf = new Float32Array(PARTICLE_COUNT);
-  private sizeBuf = new Float32Array(PARTICLE_COUNT);
+  private posBuf = new Float32Array(MAX_PARTICLES * 3);
+  private velBuf = new Float32Array(MAX_PARTICLES * 2);
+  private speedBuf = new Float32Array(MAX_PARTICLES);
+  private sizeBuf = new Float32Array(MAX_PARTICLES);
 
   private posAttr: THREE.BufferAttribute;
+  private velAttr: THREE.BufferAttribute;
   private speedAttr: THREE.BufferAttribute;
   private geo: THREE.BufferGeometry;
   private mat: THREE.ShaderMaterial;
@@ -138,15 +160,19 @@ export class FluidParticleSandbox {
     this.geo = new THREE.BufferGeometry();
     this.posAttr = new THREE.BufferAttribute(this.posBuf, 3);
     this.posAttr.setUsage(THREE.DynamicDrawUsage);
+    this.velAttr = new THREE.BufferAttribute(this.velBuf, 2);
+    this.velAttr.setUsage(THREE.DynamicDrawUsage);
     this.speedAttr = new THREE.BufferAttribute(this.speedBuf, 1);
     this.speedAttr.setUsage(THREE.DynamicDrawUsage);
 
     this.seedParticles(6.4, 3.6);
 
     this.geo.setAttribute('position', this.posAttr);
+    this.geo.setAttribute('aVel', this.velAttr);
     this.geo.setAttribute('aSpeed', this.speedAttr);
     this.geo.setAttribute('aSize', new THREE.BufferAttribute(this.sizeBuf, 1));
     this.geo.setAttribute('aSeed', new THREE.BufferAttribute(this.seeds, 1));
+    this.geo.setDrawRange(0, this.activeCount);
 
     this.mat = new THREE.ShaderMaterial({
       uniforms: {
@@ -164,6 +190,17 @@ export class FluidParticleSandbox {
     this.root.add(this.points);
   }
 
+  public setQuality(quality: GraphicsQuality): void {
+    const next = quality === 'ULTRA' ? MAX_PARTICLES : HIGH_PARTICLES;
+    if (next === this.activeCount) return;
+    this.activeCount = next;
+    this.geo.setDrawRange(0, this.activeCount);
+  }
+
+  public getParticleCount(): number {
+    return this.activeCount;
+  }
+
   private seedParticles(hw: number, hh: number): void {
     let s = 133791;
     const rand = () => {
@@ -171,23 +208,30 @@ export class FluidParticleSandbox {
       return s / 4294967296;
     };
 
-    for (let i = 0; i < PARTICLE_COUNT; i += 1) {
+    for (let i = 0; i < MAX_PARTICLES; i += 1) {
       const x = (rand() * 2 - 1) * hw * 0.98;
       const y = (rand() * 2 - 1) * hh * 0.98;
+      const vx0 = (rand() - 0.5) * 0.45;
+      const vy0 = (rand() - 0.5) * 0.45;
       this.px[i] = x;
       this.py[i] = y;
-      this.vx[i] = (rand() - 0.5) * 0.4;
-      this.vy[i] = (rand() - 0.5) * 0.4;
+      this.vx[i] = vx0;
+      this.vy[i] = vy0;
       this.seeds[i] = rand();
-      this.sizeBuf[i] = 2.0 + rand() * 3.1;
+      this.sizeBuf[i] = 1.8 + rand() * 2.9;
       this.speedBuf[i] = 0.05;
 
       const i3 = i * 3;
       this.posBuf[i3] = x;
       this.posBuf[i3 + 1] = y;
-      this.posBuf[i3 + 2] = (rand() - 0.5) * 0.35;
+      this.posBuf[i3 + 2] = (rand() - 0.5) * 0.4;
+
+      const i2 = i * 2;
+      this.velBuf[i2] = vx0;
+      this.velBuf[i2 + 1] = vy0;
     }
     this.posAttr.needsUpdate = true;
+    this.velAttr.needsUpdate = true;
     this.speedAttr.needsUpdate = true;
   }
 
@@ -216,7 +260,7 @@ export class FluidParticleSandbox {
       return false;
     }
 
-    const safeDt = Math.min(Math.max(dt, 0.004), 0.04);
+    const safeDt = Math.min(Math.max(dt, 0.003), 0.04);
     this.elapsed += safeDt;
 
     const corner = screenToWorld(viewW, 0);
@@ -232,8 +276,6 @@ export class FluidParticleSandbox {
       this.halfH = hh;
     }
 
-    // Prepare up to 2 independent hand force descriptors (Zero-GC fixed scalars)
-    // Mode: 0=none, 1=sweep, 2=pinch vortex, 3=open palm repulse, 4=supernova burst
     const hMode = [0, 0];
     const hX = [0, 0];
     const hY = [0, 0];
@@ -254,7 +296,6 @@ export class FluidParticleSandbox {
         st.burstCooldownSec = Math.max(0, st.burstCooldownSec - safeDt);
       }
 
-      // Pinch distance between thumb tip (4 -> idx 8,9) & index tip (8 -> idx 16,17) in normalized screen units
       const pinchNorm = Math.hypot(
         (h.pts[8] - h.pts[16]) * invW,
         (h.pts[9] - h.pts[17]) * invH,
@@ -273,8 +314,8 @@ export class FluidParticleSandbox {
 
       hX[slot] = wPos.x;
       hY[slot] = wPos.y;
-      hVx[slot] = Math.max(-18, Math.min(18, vxHand));
-      hVy[slot] = Math.max(-18, Math.min(18, vyHand));
+      hVx[slot] = Math.max(-20, Math.min(20, vxHand));
+      hVy[slot] = Math.max(-20, Math.min(20, vyHand));
 
       if (isPinch) {
         st.pinchHoldSec += safeDt;
@@ -289,7 +330,7 @@ export class FluidParticleSandbox {
         st.pinchHoldSec = 0;
       } else {
         st.pinchHoldSec = Math.max(0, st.pinchHoldSec - safeDt * 2.5);
-        hMode[slot] = handSpeed > 0.25 ? 1 : 0; // Gentle Sweep wake
+        hMode[slot] = handSpeed > 0.25 ? 1 : 0;
       }
 
       st.hasPrev = true;
@@ -310,15 +351,16 @@ export class FluidParticleSandbox {
       }
     }
 
-    // Integrate 8,000 particles in one tight Zero-GC pass
+    const count = this.activeCount;
     const px = this.px;
     const py = this.py;
     const vx = this.vx;
     const vy = this.vy;
     const posBuf = this.posBuf;
+    const velBuf = this.velBuf;
     const speedBuf = this.speedBuf;
     const t = this.elapsed;
-    const drag = Math.exp(-2.15 * safeDt);
+    const drag = Math.exp(-2.1 * safeDt);
     const coreDamp = Math.exp(-4.35 * safeDt);
     const maxW = this.halfW * 1.02;
     const maxH = this.halfH * 1.02;
@@ -334,15 +376,15 @@ export class FluidParticleSandbox {
     const vx1 = hVx[1];
     const vy1 = hVy[1];
 
-    for (let i = 0; i < PARTICLE_COUNT; i += 1) {
+    for (let i = 0; i < count; i += 1) {
       let x = px[i];
       let y = py[i];
       let pvx = vx[i];
       let pvy = vy[i];
 
-      // Ambient divergence-free curl drift keeps idle particles alive & luminous
-      const curlX = Math.cos(y * 0.85 + t * 0.65) * 0.95 + Math.sin(x * 0.55 - t * 0.42) * 0.48;
-      const curlY = Math.sin(x * 0.85 - t * 0.55) * 0.95 - Math.cos(y * 0.55 + t * 0.38) * 0.48;
+      // Ambient divergence-free Curl-Noise drift
+      const curlX = Math.cos(y * 0.85 + t * 0.65) * 0.98 + Math.sin(x * 0.55 - t * 0.42) * 0.52;
+      const curlY = Math.sin(x * 0.85 - t * 0.55) * 0.98 - Math.cos(y * 0.55 + t * 0.38) * 0.52;
       pvx += curlX * safeDt;
       pvy += curlY * safeDt;
 
@@ -352,70 +394,65 @@ export class FluidParticleSandbox {
         const dy = y - y0;
         const d2 = dx * dx + dy * dy;
         if (m0 === 2) {
-          // Gravitational Vortex: inward pull + orbital tangential swirl
-          if (d2 < 24.0) {
+          if (d2 < 25.0) {
             const dist = Math.sqrt(d2) + 0.08;
             const invD = 1 / dist;
             const nx = dx * invD;
             const ny = dy * invD;
             const fall = 1 / (dist + 0.42);
-            const pull = 23.0 * fall;
-            const swirl = 28.0 * fall;
+            const pull = 24.0 * fall;
+            const swirl = 29.5 * fall;
             pvx += (-nx * pull - ny * swirl) * safeDt;
             pvy += (-ny * pull + nx * swirl) * safeDt;
-            // Core velocity tether prevents singularity ejection (dt-normalized for 120Hz)
             if (dist < 0.35) {
               pvx *= coreDamp;
               pvy *= coreDamp;
             }
           }
         } else if (m0 === 4) {
-          // Supernova Burst: explosive radial launch of condensed galaxy!
-          if (d2 < 26.0) {
+          if (d2 < 28.0) {
             const dist = Math.sqrt(d2) + 0.06;
             const invD = 1 / dist;
-            const strength = (1 - dist / 5.1) * 24.0;
+            const strength = (1 - dist / 5.3) * 26.5;
             if (strength > 0) {
               pvx += dx * invD * strength;
               pvy += dy * invD * strength;
             }
           }
         } else if (m0 === 3) {
-          // Open Palm Radial Repulsion
-          if (d2 < 10.5) {
+          if (d2 < 11.0) {
             const dist = Math.sqrt(d2) + 0.1;
             const invD = 1 / dist;
-            const fall = Math.max(0, 1 - dist / 3.24);
-            const repulse = 32.0 * fall * fall;
+            const fall = Math.max(0, 1 - dist / 3.3);
+            const repulse = 33.5 * fall * fall;
             pvx += dx * invD * repulse * safeDt;
             pvy += dy * invD * repulse * safeDt;
           }
         } else if (m0 === 1) {
-          // Gentle Hand Sweep: directional flow + fluid wake swirl
-          if (d2 < 6.25) {
+          if (d2 < 6.5) {
             const dist = Math.sqrt(d2) + 0.12;
-            const fall = Math.max(0, 1 - dist / 2.5);
+            const fall = Math.max(0, 1 - dist / 2.55);
             const w = fall * fall * safeDt;
-            pvx += (vx0 * 6.5 - (dy / dist) * 5.2) * w;
-            pvy += (vy0 * 6.5 + (dx / dist) * 5.2) * w;
+            pvx += (vx0 * 6.8 - (dy / dist) * 5.4) * w;
+            pvy += (vy0 * 6.8 + (dx / dist) * 5.4) * w;
           }
         }
       }
 
-      // Hand 1 interaction (fully independent)
+      // Hand 1 interaction (independent)
       if (m1 !== 0) {
         const dx = x - x1;
         const dy = y - y1;
         const d2 = dx * dx + dy * dy;
         if (m1 === 2) {
-          if (d2 < 24.0) {
+          if (d2 < 25.0) {
             const dist = Math.sqrt(d2) + 0.08;
             const invD = 1 / dist;
             const nx = dx * invD;
             const ny = dy * invD;
             const fall = 1 / (dist + 0.42);
-            const pull = 23.0 * fall;
-            const swirl = 28.0 * fall;
+            const pull = 24.0 * fall;
+            const swirl = 29.5 * fall;
             pvx += (-nx * pull + ny * swirl) * safeDt;
             pvy += (-ny * pull - nx * swirl) * safeDt;
             if (dist < 0.35) {
@@ -424,31 +461,31 @@ export class FluidParticleSandbox {
             }
           }
         } else if (m1 === 4) {
-          if (d2 < 26.0) {
+          if (d2 < 28.0) {
             const dist = Math.sqrt(d2) + 0.06;
             const invD = 1 / dist;
-            const strength = (1 - dist / 5.1) * 24.0;
+            const strength = (1 - dist / 5.3) * 26.5;
             if (strength > 0) {
               pvx += dx * invD * strength;
               pvy += dy * invD * strength;
             }
           }
         } else if (m1 === 3) {
-          if (d2 < 10.5) {
+          if (d2 < 11.0) {
             const dist = Math.sqrt(d2) + 0.1;
             const invD = 1 / dist;
-            const fall = Math.max(0, 1 - dist / 3.24);
-            const repulse = 32.0 * fall * fall;
+            const fall = Math.max(0, 1 - dist / 3.3);
+            const repulse = 33.5 * fall * fall;
             pvx += dx * invD * repulse * safeDt;
             pvy += dy * invD * repulse * safeDt;
           }
         } else if (m1 === 1) {
-          if (d2 < 6.25) {
+          if (d2 < 6.5) {
             const dist = Math.sqrt(d2) + 0.12;
-            const fall = Math.max(0, 1 - dist / 2.5);
+            const fall = Math.max(0, 1 - dist / 2.55);
             const w = fall * fall * safeDt;
-            pvx += (vx1 * 6.5 + (dy / dist) * 5.2) * w;
-            pvy += (vy1 * 6.5 - (dx / dist) * 5.2) * w;
+            pvx += (vx1 * 6.8 + (dy / dist) * 5.4) * w;
+            pvy += (vy1 * 6.8 - (dx / dist) * 5.4) * w;
           }
         }
       }
@@ -456,10 +493,9 @@ export class FluidParticleSandbox {
       pvx *= drag;
       pvy *= drag;
 
-      // Clamp extreme velocities for numerical stability
       const spdSq = pvx * pvx + pvy * pvy;
-      if (spdSq > 484) {
-        const invS = 22 / Math.sqrt(spdSq);
+      if (spdSq > 576) {
+        const invS = 24 / Math.sqrt(spdSq);
         pvx *= invS;
         pvy *= invS;
       }
@@ -467,7 +503,6 @@ export class FluidParticleSandbox {
       x += pvx * safeDt;
       y += pvy * safeDt;
 
-      // Soft toroidal wrap with slight damping keeps 8,000 particles evenly distributed
       if (x > maxW) x -= maxW * 2;
       else if (x < -maxW) x += maxW * 2;
       if (y > maxH) y -= maxH * 2;
@@ -481,10 +516,15 @@ export class FluidParticleSandbox {
       const i3 = i * 3;
       posBuf[i3] = x;
       posBuf[i3 + 1] = y;
-      speedBuf[i] = Math.min(1.0, Math.sqrt(pvx * pvx + pvy * pvy) / 8.5);
+
+      const i2 = i * 2;
+      velBuf[i2] = pvx;
+      velBuf[i2 + 1] = pvy;
+      speedBuf[i] = Math.min(1.0, Math.sqrt(pvx * pvx + pvy * pvy) / 8.8);
     }
 
     this.posAttr.needsUpdate = true;
+    this.velAttr.needsUpdate = true;
     this.speedAttr.needsUpdate = true;
     this.mat.uniforms.uOpacity.value = fadeAlpha;
     this.root.visible = true;

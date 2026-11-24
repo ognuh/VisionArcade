@@ -1,9 +1,13 @@
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import type { GraphicsQuality } from '../types/vision';
+import type { BodyControlState } from '../vision/bodyController';
 import { FluidParticleSandbox } from './fluidParticles';
 import { Lightning3DEngine } from './lightning3d';
+import { Runner3DGame, type RunnerHudSnapshot } from './runnerGame';
 import { elasticScale02To10 } from './transitionManager';
 import type { HandPose2D } from './types';
 
@@ -25,7 +29,7 @@ const PLANETS: PlanetSpec[] = [
     baseSpin: 0.42,
     tiltZ: 0.41,
     atmoColor: 0x38bdf8,
-    atmoIntensity: 1.25,
+    atmoIntensity: 1.48,
   },
   {
     id: 'MARS',
@@ -34,7 +38,7 @@ const PLANETS: PlanetSpec[] = [
     baseSpin: 0.36,
     tiltZ: 0.44,
     atmoColor: 0xfb923c,
-    atmoIntensity: 0.82,
+    atmoIntensity: 1.04,
   },
   {
     id: 'SATURN',
@@ -43,7 +47,7 @@ const PLANETS: PlanetSpec[] = [
     baseSpin: 0.56,
     tiltZ: 0.46,
     atmoColor: 0xfde68a,
-    atmoIntensity: 0.58,
+    atmoIntensity: 0.78,
   },
   {
     id: 'JUPITER',
@@ -52,7 +56,7 @@ const PLANETS: PlanetSpec[] = [
     baseSpin: 0.68,
     tiltZ: 0.06,
     atmoColor: 0xfdba74,
-    atmoIntensity: 0.62,
+    atmoIntensity: 0.82,
   },
   {
     id: 'NEPTUNE',
@@ -61,7 +65,7 @@ const PLANETS: PlanetSpec[] = [
     baseSpin: 0.52,
     tiltZ: 0.49,
     atmoColor: 0x22d3ee,
-    atmoIntensity: 1.15,
+    atmoIntensity: 1.38,
   },
   {
     id: 'SUN',
@@ -70,7 +74,7 @@ const PLANETS: PlanetSpec[] = [
     baseSpin: 0.24,
     tiltZ: 0.12,
     atmoColor: 0xf97316,
-    atmoIntensity: 1.5,
+    atmoIntensity: 1.65,
   },
 ];
 
@@ -78,7 +82,7 @@ const SWITCH_COOLDOWN_SEC = 0.85;
 const SWITCH_DURATION_SEC = 0.65; // 650ms GLSL Simplex Dissolve -> Coalesce planet transition
 const PLANET_DISSOLVE_SEC = 0.65; // 650ms Ethereal Dissolve when retracting hands
 const HUD_DISPLAY_SEC = 2.6;
-const BURST_PARTICLE_COUNT = 450; // 450 3D Curl-Noise Stardust Particles
+const BURST_PARTICLE_COUNT = 1000; // 1,000 3D Curl-Noise Stardust Dissolve Particles (Ultra Cinema)
 const BH_STAR_COUNT = 1500;
 const CAMERA_FOV_DEG = 42;
 const CAMERA_Z = 10;
@@ -214,6 +218,7 @@ const ALPHA_OUTPUT_SHADER = {
     tDiffuse: { value: null as THREE.Texture | null },
     tSceneAlpha: { value: null as THREE.Texture | null },
     uExposure: { value: 1.08 },
+    uDarkCoreSuppress: { value: 1.0 },
   },
   vertexShader: `
     varying vec2 vUv;
@@ -226,6 +231,7 @@ const ALPHA_OUTPUT_SHADER = {
     uniform sampler2D tDiffuse;
     uniform sampler2D tSceneAlpha;
     uniform float uExposure;
+    uniform float uDarkCoreSuppress;
     varying vec2 vUv;
 
     vec3 acesToneMap(vec3 x) {
@@ -243,7 +249,7 @@ const ALPHA_OUTPUT_SHADER = {
 
       // Prevent inward bloom washout over pitch-black Event Horizon & deep night shadows
       float sceneLuma = dot(sceneRaw.rgb, vec3(0.299, 0.587, 0.114));
-      float darkCoreMask = smoothstep(0.06, 0.0, sceneLuma) * smoothstep(0.88, 0.99, sceneRaw.a);
+      float darkCoreMask = smoothstep(0.06, 0.0, sceneLuma) * smoothstep(0.88, 0.99, sceneRaw.a) * uDarkCoreSuppress;
       vec3 hdr = mix(bloomed, bloomed * 0.14, darkCoreMask) * uExposure;
 
       vec3 mapped = acesToneMap(hdr);
@@ -712,15 +718,15 @@ void main() {
 
   // 2. Upper & Lower Gravitational Lensing Arches (bent far-side disk image)
   float archR = length(vec2(p.x * 0.98, p.y * 1.04));
-  float archCore = exp(-pow((archR - (ehR + 0.058)) / 0.040, 2.0));
-  float archOuter = exp(-pow((archR - (ehR + 0.120)) / 0.092, 2.0)) * 0.30;
+  float archCore = exp(-pow((archR - (ehR + 0.056)) / 0.038, 2.0)) * 1.24;
+  float archOuter = exp(-pow((archR - (ehR + 0.125)) / 0.095, 2.0)) * 0.36;
   float archSwirl = fbmPolar(vec2(archR * 15.0, atan(p.y, p.x) * 3.6 - t * 2.1));
   float archGate = smoothstep(0.02, 0.24, abs(p.y));
-  float lowerWeight = (p.y < 0.0) ? 0.72 : 1.0;
-  float lensing = (archCore * (0.55 + 0.65 * archSwirl) + archOuter * archSwirl) * archGate * lowerWeight;
+  float lowerWeight = (p.y < 0.0) ? 0.78 : 1.05;
+  float lensing = (archCore * (0.58 + 0.68 * archSwirl) + archOuter * archSwirl) * archGate * lowerWeight;
 
   // 3. Razor-sharp thin Photon Ring right along Event Horizon edge
-  float photonRing = exp(-pow((r - (ehR + 0.005)) / 0.0062, 2.0)) * 1.15;
+  float photonRing = exp(-pow((r - (ehR + 0.005)) / 0.0058, 2.0)) * 1.38;
   float innerRim = exp(-max(r - ehR, 0.0) * 14.0) * 0.30;
 
   // Pitch-black Event Horizon void (strictly obsidian black inside ehR except foreground equatorial stream)
@@ -1394,9 +1400,13 @@ export class Cosmos3DEngine {
   private sphereGeo: THREE.SphereGeometry | null = null;
   private atmoGeo: THREE.SphereGeometry | null = null;
 
-  // Shared Three.js Volumetric Plasma Lightning & Fluid 8,000-Particle Sandbox (zero extra WebGL context / Bloom pass)
+  // Shared Three.js Volumetric Plasma Lightning, 15k Fluid Sandbox & Ultra 3D Runner (1 WebGL context / 1 Half-Res Bloom)
   private lightning3D = new Lightning3DEngine();
   private fluidSandbox = new FluidParticleSandbox();
+  private runner3D = new Runner3DGame();
+  private gltfLoader = new GLTFLoader();
+  private customGlbGroup: THREE.Group | null = null;
+  private customGlbLabel = '';
 
   private burstPoints: THREE.Points | null = null;
   private burstMat: THREE.ShaderMaterial | null = null;
@@ -1610,8 +1620,9 @@ export class Cosmos3DEngine {
     this.fluidSandbox.root.visible = true;
     if (this.burstPoints) this.burstPoints.visible = true;
 
-    // Compile all shaders (Cosmos + Dissolve + 3D Lightning + Fluid + UnrealBloomPass) offscreen
+    // Compile all shaders (Cosmos + Dissolve + 3D Lightning + 15k Fluid + Runner + UnrealBloomPass) offscreen
     this.renderer.compile(this.scene, this.camera);
+    this.renderer.compile(this.runner3D.scene, this.runner3D.camera);
     this.renderer.setRenderTarget(this.sceneRT);
     this.renderer.clear();
     this.renderer.render(this.scene, this.camera);
@@ -1639,8 +1650,18 @@ export class Cosmos3DEngine {
     this.compileAllGpuResources();
   }
 
+  public setQuality(quality: GraphicsQuality): void {
+    this.fluidSandbox.setQuality(quality);
+    this.bloomPass.strength = quality === 'ULTRA' ? 0.88 : 0.72;
+  }
+
+  public getFluidParticleCount(): number {
+    return this.fluidSandbox.getParticleCount();
+  }
+
   public setLightningSfxEnabled(enabled: boolean): void {
     this.lightning3D.setSfxEnabled(enabled);
+    this.runner3D.setSfxEnabled(enabled);
   }
 
   public resetLightning(): void {
@@ -1649,6 +1670,65 @@ export class Cosmos3DEngine {
 
   public resetFluid(): void {
     this.fluidSandbox.reset();
+  }
+
+  public startRunner(onBeginCalibration?: () => void, skipCountdown = false): void {
+    this.runner3D.startRun(onBeginCalibration, skipCountdown);
+  }
+
+  public resetRunner(): void {
+    this.runner3D.resetToReady();
+  }
+
+  public getRunnerSnapshot(): RunnerHudSnapshot {
+    return this.runner3D.getHudSnapshot();
+  }
+
+  /** Loads a user-dropped or public/models/ .glb model directly into Cosmos hand-levitation stage. */
+  public async loadCustomGlbFromBuffer(buffer: ArrayBuffer, label: string): Promise<void> {
+    this.ensureCoreResources();
+    const gltf = await this.gltfLoader.parseAsync(buffer, '');
+    this.mountCustomGlbScene(gltf.scene, label);
+  }
+
+  public async loadCustomGlbUrl(url: string, label: string): Promise<void> {
+    this.ensureCoreResources();
+    const gltf = await this.gltfLoader.loadAsync(url);
+    this.mountCustomGlbScene(gltf.scene, label);
+  }
+
+  private mountCustomGlbScene(rootScene: THREE.Group, label: string): void {
+    this.clearCustomGlb();
+    const box = new THREE.Box3().setFromObject(rootScene);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z, 0.001);
+    const normScale = 2.0 / maxDim;
+    rootScene.position.sub(center).multiplyScalar(normScale);
+    rootScene.scale.multiplyScalar(normScale);
+
+    const wrapper = new THREE.Group();
+    wrapper.add(rootScene);
+    wrapper.visible = false;
+    this.planetContainer.add(wrapper);
+    this.customGlbGroup = wrapper;
+    this.customGlbLabel = `CUSTOM GLB // ${label.toUpperCase()}`;
+    this.hudTimer = HUD_DISPLAY_SEC;
+  }
+
+  public clearCustomGlb(): void {
+    if (!this.customGlbGroup) return;
+    this.planetContainer.remove(this.customGlbGroup);
+    this.customGlbGroup.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry.dispose();
+        const m = obj.material;
+        if (Array.isArray(m)) m.forEach((x) => x.dispose());
+        else m.dispose();
+      }
+    });
+    this.customGlbGroup = null;
+    this.customGlbLabel = '';
   }
 
   /** Reports whether Gargantua Black Hole is charging or active (blocks Air Swipe). */
@@ -2029,6 +2109,10 @@ export class Cosmos3DEngine {
     lightningEnter: number;
     fluidActive: boolean;
     fluidFade: number;
+    runnerActive?: boolean;
+    bodyState?: BodyControlState | null;
+    onBeginRunnerCalibration?: () => void;
+    onFinishRunnerCalibration?: () => void;
     hands: HandPose2D[];
     dt: number;
     viewW: number;
@@ -2043,6 +2127,10 @@ export class Cosmos3DEngine {
       lightningEnter,
       fluidActive,
       fluidFade,
+      runnerActive = false,
+      bodyState = null,
+      onBeginRunnerCalibration,
+      onFinishRunnerCalibration,
       hands,
       dt,
       viewW,
@@ -2053,6 +2141,48 @@ export class Cosmos3DEngine {
     this.resize(viewW, viewH);
     this.ensureCoreResources();
     this.time += dt;
+
+    // Exclusive Ultra 3D Neon Subway Runner Pass (shares single Half-Res UnrealBloomPass + ACES tone map)
+    if (runnerActive && bodyState) {
+      this.planetContainer.visible = false;
+      this.bhRoot.visible = false;
+      this.lightning3D.clear();
+      this.fluidSandbox.clear();
+
+      this.runner3D.update(
+        bodyState,
+        dt,
+        viewW,
+        viewH,
+        overlayCtx,
+        onFinishRunnerCalibration,
+        onBeginRunnerCalibration,
+      );
+
+      this.outputPass.uniforms.uDarkCoreSuppress.value = 0.0;
+      const prevStrength = this.bloomPass.strength;
+      const prevRadius = this.bloomPass.radius;
+      const prevThreshold = this.bloomPass.threshold;
+      this.bloomPass.strength = 0.40;
+      this.bloomPass.radius = 0.32;
+      this.bloomPass.threshold = 0.82;
+
+      this.renderer.setRenderTarget(this.sceneRT);
+      this.renderer.setClearColor(0x050612, 1);
+      this.renderer.clear();
+      this.renderer.render(this.runner3D.scene, this.runner3D.camera);
+      this.renderer.setClearColor(0x000000, 0);
+      this.renderer.setRenderTarget(null);
+      this.composer.render();
+
+      this.bloomPass.strength = prevStrength;
+      this.bloomPass.radius = prevRadius;
+      this.bloomPass.threshold = prevThreshold;
+      this.hasRenderedFrame = true;
+      return;
+    }
+
+    this.outputPass.uniforms.uDarkCoreSuppress.value = 1.0;
 
     let anyCosmos = false;
     if (cosmosActive && cosmosFade > 0.01) {
@@ -2398,7 +2528,13 @@ export class Cosmos3DEngine {
         this.planetContainer.scale.setScalar(Math.max(0.04, baseScale));
       }
 
-      activePlanet.root.visible = effectivePlanetVis > 0.015;
+      if (this.customGlbGroup) {
+        activePlanet.root.visible = false;
+        this.customGlbGroup.visible = effectivePlanetVis > 0.015;
+        this.customGlbGroup.rotation.y = this.spinY;
+      } else {
+        activePlanet.root.visible = effectivePlanetVis > 0.015;
+      }
       activePlanet.spinGroup.rotation.y = this.spinY;
       if (activePlanet.cloudMesh) {
         const cloudSpin = this.spinY * 1.18 + this.time * 0.06;
@@ -2426,7 +2562,7 @@ export class Cosmos3DEngine {
             planetScreenX,
             planetScreenY,
             planetRadiusPx,
-            PLANETS[this.planetIdx].tag,
+            this.customGlbGroup ? this.customGlbLabel : PLANETS[this.planetIdx].tag,
             hudAlpha,
           );
         }
@@ -2632,8 +2768,10 @@ export class Cosmos3DEngine {
         }
       }
     });
+    this.clearCustomGlb();
     this.lightning3D.dispose();
     this.fluidSandbox.dispose();
+    this.runner3D.dispose();
     this.sceneRT.dispose();
     this.bloomPass.dispose();
     this.composer.dispose();

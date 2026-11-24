@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Camera, Loader2, RefreshCw } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type DragEvent } from 'react';
+import { Camera, Crosshair, Loader2, Play, RefreshCw, RotateCcw } from 'lucide-react';
 import { AirCursor, type AirCursorHandle } from './components/AirCursor';
 import { HoloText3D, type HoloText3DHandle } from './components/HoloText3D';
 import { PrismBar } from './components/PrismBar';
+import type { RunnerHudSnapshot } from './fx/runnerGame';
 import { OpticalPrismEngine } from './prism/prismEngine';
 import {
   MODE_CYCLE_ORDER,
@@ -10,26 +11,36 @@ import {
   type CameraDeviceItem,
   type CameraPresetId,
   type CycleModeId,
+  type FpsTarget,
   type GestureType,
+  type GraphicsQuality,
   type Landmark3D,
   type PrismSettings,
+  type TrackerTaskMode,
 } from './types/vision';
 import { classifyHandGesture, GestureStabilizer } from './vision/gesture';
 import { GestureManager, type SwipeIndicatorState } from './vision/gestureManager';
 import { HandBlinkDetector } from './vision/handBlink';
-import { HandTrackerClient } from './vision/handTrackerClient';
+import { HandTrackerClient, type TrackingResultPacket } from './vision/handTrackerClient';
 import {
   createMockCameraStream,
   generateMockHands,
+  generateMockPose,
   type MockPoseId,
 } from './vision/mockHands';
 
 interface VisionTestBridge {
   setPose: (pose: MockPoseId) => void;
   setMode: (mode: PrismSettings['mode']) => void;
+  setQuality: (quality: GraphicsQuality) => void;
+  setFpsTarget: (fpsTarget: FpsTarget) => void;
   setNoteOpen: (open: boolean) => void;
   setToolsOpen: (open: boolean) => void;
   setAirDraw: (enabled: boolean) => void;
+  startRunner: (skipCountdown?: boolean) => void;
+  recalibrateRunner: () => void;
+  getRunnerSnapshot: () => RunnerHudSnapshot | null;
+  getFluidParticleCount: () => number;
   prewarmCosmos: () => void;
   resetPerf: () => void;
   getPerf: () => {
@@ -47,8 +58,10 @@ interface VisionTestBridge {
   runLiveWorkerTest: (
     engineMode?: AiEngineMode,
     frames?: number,
+    taskMode?: TrackerTaskMode,
   ) => Promise<{
     isWorker: boolean;
+    taskMode: TrackerTaskMode;
     completedFrames: number;
     steadyAvgInferMs: number;
     steadyMaxInferMs: number;
@@ -63,6 +76,8 @@ interface VisionTestBridge {
     noteOpen: boolean;
     toolsOpen: boolean;
     airDrawEnabled: boolean;
+    graphicsQuality: GraphicsQuality;
+    fpsTarget: FpsTarget;
     holoText: string;
     engineStatus: EngineStatus;
   };
@@ -89,6 +104,8 @@ interface CachedButtonRect {
 const CAMERA_PRESET_STORAGE_KEY = 'visionarcade.cameraPreset';
 const SFX_STORAGE_KEY = 'visionarcade.sfxEnabled';
 const AI_ENGINE_STORAGE_KEY = 'visionarcade.aiEngineMode';
+const QUALITY_STORAGE_KEY = 'visionarcade.graphicsQuality';
+const FPS_TARGET_STORAGE_KEY = 'visionarcade.fpsTarget';
 const LEGACY_STORAGE_KEYS = [
   'visionarcade.arcadeHighScore',
   'visionarcade.faceMaskMode',
@@ -101,10 +118,9 @@ const DWELL_COOLDOWN_MS = 800;
 const DOCK_AUTO_FADE_MS = 2500;
 const MAGNETIC_HIT_PADDING_PX = 14;
 const MAGNETIC_PULL = 0.38;
-const FPS_UPDATE_INTERVAL_MS = 500;
-const EMA_ALPHA = 2 / 61;
+const FPS_UPDATE_INTERVAL_MS = 450;
+const EMA_ALPHA = 2 / 41;
 const MODE_TOAST_MS = 1000;
-const TARGET_FPS_INTERVAL_MS = 1000 / 120; // 8.333ms hardware-paced 120 FPS target
 
 const TARGET_HOLO_PHRASE = 'xin chào tôi là hưng';
 const FIST_CLEAR_HOLD_SEC = 1.5;
@@ -118,6 +134,22 @@ const MODE_DISPLAY_NAME: Record<CycleModeId, string> = {
   MYSTIC: 'MYSTIC',
   RIPPLE: 'RIPPLE',
   FLUID: 'FLUID',
+  RUNNER: 'RUNNER',
+};
+
+const EMPTY_RUNNER_SNAP: RunnerHudSnapshot = {
+  phase: 'READY',
+  score: 0,
+  coins: 0,
+  bestScore: 0,
+  speedMultiplier: 1.0,
+  countdownNum: 0,
+  lane: 0,
+  actionLabel: 'READY',
+  hasBody: false,
+  isCalibrated: false,
+  handsUpProgress: 0,
+  distance: 0,
 };
 
 function purgeLegacyStorage(): void {
@@ -133,11 +165,11 @@ function purgeLegacyStorage(): void {
 function loadSavedCameraPreset(): CameraPresetId {
   try {
     const v = window.localStorage.getItem(CAMERA_PRESET_STORAGE_KEY);
-    if (v === 'AUTO' || v === '720P' || v === '1080P') return v;
-    if (v === '720P_30' || v === '720P_60') return '720P';
-    if (v === '1080P_30' || v === '1080P_60') return '1080P';
+    if (v === 'AUTO' || v === '720P60' || v === '720P30' || v === '1080P60') return v;
+    if (v === '720P') return '720P60';
+    if (v === '1080P') return '1080P60';
   } catch {
-    // ignore storage errors
+    // ignore
   }
   return 'AUTO';
 }
@@ -146,7 +178,7 @@ function saveCameraPreset(preset: CameraPresetId): void {
   try {
     window.localStorage.setItem(CAMERA_PRESET_STORAGE_KEY, preset);
   } catch {
-    // ignore storage errors
+    // ignore
   }
 }
 
@@ -155,7 +187,7 @@ function loadSavedSfxEnabled(): boolean {
     const v = window.localStorage.getItem(SFX_STORAGE_KEY);
     if (v === '0') return false;
   } catch {
-    // ignore storage errors
+    // ignore
   }
   return true;
 }
@@ -164,25 +196,63 @@ function saveSfxEnabled(enabled: boolean): void {
   try {
     window.localStorage.setItem(SFX_STORAGE_KEY, enabled ? '1' : '0');
   } catch {
-    // ignore storage errors
+    // ignore
   }
 }
 
 function loadSavedAiEngineMode(): AiEngineMode {
   try {
     const v = window.localStorage.getItem(AI_ENGINE_STORAGE_KEY);
-    if (v === 'AUTO' || v === 'GPU' || v === 'CPU') return v;
+    if (v === 'GPU' || v === 'AUTO' || v === 'CPU') return v;
   } catch {
-    // ignore storage errors
+    // ignore
   }
-  return 'AUTO';
+  return 'GPU';
 }
 
 function saveAiEngineMode(mode: AiEngineMode): void {
   try {
     window.localStorage.setItem(AI_ENGINE_STORAGE_KEY, mode);
   } catch {
-    // ignore storage errors
+    // ignore
+  }
+}
+
+function loadSavedQuality(): GraphicsQuality {
+  try {
+    const v = window.localStorage.getItem(QUALITY_STORAGE_KEY);
+    if (v === 'ULTRA' || v === 'HIGH') return v;
+  } catch {
+    // ignore
+  }
+  return 'ULTRA';
+}
+
+function saveQuality(q: GraphicsQuality): void {
+  try {
+    window.localStorage.setItem(QUALITY_STORAGE_KEY, q);
+  } catch {
+    // ignore
+  }
+}
+
+function loadSavedFpsTarget(): FpsTarget {
+  try {
+    const v = window.localStorage.getItem(FPS_TARGET_STORAGE_KEY);
+    if (v === 'MAX') return 'MAX';
+    if (v === '120') return 120;
+    if (v === '60') return 60;
+  } catch {
+    // ignore
+  }
+  return 'MAX';
+}
+
+function saveFpsTarget(target: FpsTarget): void {
+  try {
+    window.localStorage.setItem(FPS_TARGET_STORAGE_KEY, String(target));
+  } catch {
+    // ignore
   }
 }
 
@@ -197,6 +267,8 @@ function createInitialSettings(): PrismSettings {
     noteOpen: false,
     sfxEnabled: loadSavedSfxEnabled(),
     aiEngineMode: loadSavedAiEngineMode(),
+    graphicsQuality: loadSavedQuality(),
+    fpsTarget: loadSavedFpsTarget(),
   };
 }
 
@@ -213,22 +285,25 @@ interface ExtendedTrackSettings extends MediaTrackSettings {
   focusDistance?: number;
 }
 
+/**
+ * 60 FPS priority webcam constraints:
+ * - Requests ideal 60 FPS with min 25 FPS so 60fps sources (USB webcam / Phone / OBS) lock true 60 FPS,
+ *   while 30fps laptop webcams smoothly lock 30 FPS and never drop to 10fps Windows Media Foundation profiles.
+ */
 function getVideoConstraintsForPreset(preset: CameraPresetId): MediaTrackConstraints {
   switch (preset) {
-    case '720P':
-      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { min: 25, ideal: 30 } };
-    case '1080P':
-      return { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { min: 25, ideal: 30 } };
+    case '720P60':
+      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60, min: 25 } };
+    case '720P30':
+      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, min: 25 } };
+    case '1080P60':
+      return { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60, min: 25 } };
     case 'AUTO':
     default:
-      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { min: 25, ideal: 30 } };
+      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60, min: 25 } };
   }
 }
 
-/**
- * Safely opens webcam with guaranteed 25–30 FPS pacing (prevents Windows Media Foundation
- * from selecting 1280x720 @ 10fps low-light profile; falls back cleanly to 640x360 @ 30fps on OverconstrainedError).
- */
 async function openCameraStream(
   preferredDeviceId?: string,
   preset: CameraPresetId = 'AUTO',
@@ -240,16 +315,16 @@ async function openCameraStream(
 
   const attempts: MediaTrackConstraints[] = [
     { ...baseVideo, ...deviceFilter },
-    { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { min: 25, ideal: 30 }, ...deviceFilter },
+    { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, min: 25 }, ...deviceFilter },
+    { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 30, min: 25 }, ...deviceFilter },
     { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 30 }, ...deviceFilter },
   ];
 
-  // If a saved deviceId was disconnected, add generic default-camera fallback at the end
   if (preferredDeviceId) {
     attempts.push(
       { ...baseVideo, facingMode: 'user' },
-      { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { min: 25, ideal: 30 }, facingMode: 'user' },
-      { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 30 }, facingMode: 'user' },
+      { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, min: 25 }, facingMode: 'user' },
+      { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 30, min: 25 }, facingMode: 'user' },
     );
   }
 
@@ -267,7 +342,6 @@ async function openCameraStream(
   throw lastErr instanceof Error ? lastErr : new Error('Unable to open camera stream.');
 }
 
-/** Safely locks Auto-Focus after 1.5s settle (no-op on virtual cameras with zero errors). */
 function scheduleSafeFocusLock(
   stream: MediaStream,
   isCancelled: () => boolean,
@@ -303,7 +377,7 @@ function scheduleSafeFocusLock(
             .catch(() => {});
         }
       } catch {
-        // Driver without UVC focus lock — ignore safely
+        // ignore UVC focus unsupported
       }
     }, 1500);
   } catch {
@@ -322,6 +396,7 @@ export default function App() {
   const [cameraPreset, setCameraPreset] = useState<CameraPresetId>(loadSavedCameraPreset);
   const [activeAiDelegate, setActiveAiDelegate] = useState<'GPU' | 'CPU'>('GPU');
   const [retryToken, setRetryToken] = useState(0);
+  const [runnerHud, setRunnerHud] = useState<RunnerHudSnapshot>(EMPTY_RUNNER_SNAP);
 
   // Centered 3D Extruded Hologram Text state
   const [holoText, setHoloText] = useState<string>('');
@@ -332,7 +407,9 @@ export default function App() {
   const glCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const cosmosCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const glowCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pipCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const fpsTextRef = useRef<HTMLSpanElement | null>(null);
+  const camFpsTextRef = useRef<HTMLSpanElement | null>(null);
   const aiFpsTextRef = useRef<HTMLSpanElement | null>(null);
   const modeTextRef = useRef<HTMLSpanElement | null>(null);
   const uiRootRef = useRef<HTMLDivElement | null>(null);
@@ -387,13 +464,16 @@ export default function App() {
 
   useEffect(() => {
     settingsRef.current = settings;
+    const targetTask: TrackerTaskMode =
+      settings.mode === 'RUNNER' && !settings.airDrawEnabled ? 'POSE' : 'HAND';
+    trackerClientRef.current?.setTaskMode(targetTask);
+    engineRef.current?.setQuality(settings.graphicsQuality);
   }, [settings]);
 
   useEffect(() => {
     toolsOpenRef.current = toolsOpen;
   }, [toolsOpen]);
 
-  /** Enumerates available videoinput devices for manual selection in Side Inspector. */
   const refreshCameraList = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
     try {
@@ -418,7 +498,6 @@ export default function App() {
     return () => md.removeEventListener('devicechange', onChange);
   }, [refreshCameraList]);
 
-  /** Hot-swaps camera source and/or resolution cleanly without stalling WebGL2/Three.js/Worker. */
   const applyCameraConfig = useCallback(
     async (deviceId: string, preset: CameraPresetId) => {
       const video = videoRef.current;
@@ -474,7 +553,6 @@ export default function App() {
     [applyCameraConfig, selectedCameraId],
   );
 
-  /** Recomputes cached +14px magnetic button DOMRects (zero layout thrashing inside rAF). */
   const refreshCachedUiRects = useCallback(() => {
     const root = uiRootRef.current ?? document;
     const buttons = root.querySelectorAll<HTMLButtonElement>('[data-air-clickable="true"]');
@@ -540,9 +618,9 @@ export default function App() {
     [applyDockStyle],
   );
 
-  const showModeToast = useCallback((mode: CycleModeId) => {
+  const showModeToast = useCallback((label: string) => {
     toastSeqRef.current += 1;
-    setModeToast({ text: MODE_DISPLAY_NAME[mode], key: toastSeqRef.current });
+    setModeToast({ text: label, key: toastSeqRef.current });
     if (toastTimerRef.current !== null) {
       window.clearTimeout(toastTimerRef.current);
     }
@@ -566,8 +644,18 @@ export default function App() {
           saveAiEngineMode(patch.aiEngineMode);
           trackerClientRef.current?.setEngineMode(patch.aiEngineMode);
         }
+        if (patch.graphicsQuality !== undefined && patch.graphicsQuality !== prev.graphicsQuality) {
+          saveQuality(patch.graphicsQuality);
+          engineRef.current?.setQuality(patch.graphicsQuality);
+        }
+        if (patch.fpsTarget !== undefined && patch.fpsTarget !== prev.fpsTarget) {
+          saveFpsTarget(patch.fpsTarget);
+        }
         if (patch.mode && patch.mode !== 'AUTO' && patch.mode !== prev.mode) {
-          showModeToast(patch.mode);
+          showModeToast(MODE_DISPLAY_NAME[patch.mode]);
+          if (patch.mode === 'RUNNER') {
+            engineRef.current?.resetRunner();
+          }
         }
         return { ...prev, ...patch };
       });
@@ -589,7 +677,10 @@ export default function App() {
         const idx = MODE_CYCLE_ORDER.indexOf(currentEffective);
         const len = MODE_CYCLE_ORDER.length;
         const nextMode = MODE_CYCLE_ORDER[(idx + dir + len) % len];
-        showModeToast(nextMode);
+        showModeToast(MODE_DISPLAY_NAME[nextMode]);
+        if (nextMode === 'RUNNER') {
+          engineRef.current?.resetRunner();
+        }
         return { ...prev, mode: nextMode, airDrawEnabled: false };
       });
     },
@@ -606,6 +697,24 @@ export default function App() {
     setHoloText('');
     setHoloCompleted(false);
   }, []);
+
+  const handleDropGlb = useCallback(
+    (e: DragEvent<HTMLElement>) => {
+      e.preventDefault();
+      const file = e.dataTransfer?.files?.[0];
+      if (!file || !file.name.toLowerCase().endsWith('.glb')) return;
+      void engineRef.current
+        ?.loadCustomGlbFromFile(file)
+        .then(() => {
+          setSettings((prev) => ({ ...prev, mode: 'COSMOS', airDrawEnabled: false }));
+          showModeToast(`GLB · ${file.name.replace(/\.glb$/i, '')}`);
+        })
+        .catch(() => {
+          showModeToast('INVALID GLB');
+        });
+    },
+    [showModeToast],
+  );
 
   const advanceHoloTyping = useCallback(() => {
     if (holoCursorIdxRef.current >= TARGET_HOLO_PHRASE.length) {
@@ -689,6 +798,13 @@ export default function App() {
       'FLUID_INTERACT',
       'HAND_BLINK',
       'FIST_BOTH',
+      'RUNNER_STAND',
+      'RUNNER_HANDS_UP',
+      'RUNNER_LEFT',
+      'RUNNER_RIGHT',
+      'RUNNER_JUMP',
+      'RUNNER_CROUCH',
+      'RUNNER_DEMO_SEQ',
     ]);
     const requestedPose = searchParams.get('pose');
     const initialTestPose: MockPoseId =
@@ -723,6 +839,7 @@ export default function App() {
         if (!glCanvas) throw new Error('WebGL2 viewport failed to mount.');
 
         let latestHands: Landmark3D[][] = [];
+        let latestPose: Landmark3D[] | null = null;
         let latestGestures: GestureType[] = ['IDLE', 'IDLE'];
         let handPacketSeq = 0;
         let lastAiFpsUpdateMs = 0;
@@ -730,15 +847,16 @@ export default function App() {
         trackerClient = new HandTrackerClient();
         trackerClientRef.current = trackerClient;
 
-        const onWorkerResult = (packet: {
-          landmarks: Landmark3D[][];
-          aiFps: number;
-          inferMs: number;
-          delegate: 'GPU' | 'CPU';
-        }) => {
+        const onWorkerResult = (packet: TrackingResultPacket) => {
           if (cancelled) return;
           const now = performance.now();
-          latestHands = packet.landmarks;
+          if (packet.taskMode === 'POSE') {
+            latestPose = packet.poseLandmarks;
+            latestHands = [];
+          } else {
+            latestHands = packet.landmarks;
+            latestPose = null;
+          }
           handPacketSeq += 1;
 
           const stab0 = stabilizersRef.current[0];
@@ -757,7 +875,6 @@ export default function App() {
 
           const curSettings = settingsRef.current;
 
-          // Centralized Priority GestureManager FSM: UI_CURSOR > AIR_DRAW > MODE_GESTURE > AIR_SWIPE
           const gestureDecision = gestureManagerRef.current.update({
             hands: latestHands,
             gestures: latestGestures,
@@ -772,7 +889,6 @@ export default function App() {
             handleStepMode(gestureDecision.swipeDir);
           }
 
-          // Centered 3D Hologram Text rapid hand-blink typing
           if (curSettings.noteOpen && latestHands.length > 0) {
             const blinkEvents = blinkDetectorRef.current.update(latestHands, latestGestures, now);
             if (blinkEvents.length > 0) {
@@ -799,6 +915,8 @@ export default function App() {
         };
 
         const savedPreset = loadSavedCameraPreset();
+        const initialTask: TrackerTaskMode =
+          settingsRef.current.mode === 'RUNNER' ? 'POSE' : 'HAND';
         let stream: MediaStream;
 
         let perfSamples = 0;
@@ -822,6 +940,12 @@ export default function App() {
                 airDrawEnabled: false,
               }));
             },
+            setQuality: (graphicsQuality: GraphicsQuality) => {
+              setSettings((prev) => ({ ...prev, graphicsQuality }));
+            },
+            setFpsTarget: (fpsTarget: FpsTarget) => {
+              setSettings((prev) => ({ ...prev, fpsTarget }));
+            },
             setNoteOpen: (open: boolean) => {
               setSettings((prev) => ({ ...prev, noteOpen: open }));
             },
@@ -831,6 +955,14 @@ export default function App() {
             setAirDraw: (airDrawEnabled: boolean) => {
               setSettings((prev) => ({ ...prev, airDrawEnabled }));
             },
+            startRunner: (skipCountdown = false) => {
+              engineRef.current?.startRunner(skipCountdown);
+            },
+            recalibrateRunner: () => {
+              engineRef.current?.recalibrateRunner();
+            },
+            getRunnerSnapshot: () => engineRef.current?.getRunnerSnapshot() ?? null,
+            getFluidParticleCount: () => engineRef.current?.getFluidParticleCount() ?? 0,
             prewarmCosmos: () => {
               engineRef.current?.prewarmCosmosNow();
             },
@@ -849,8 +981,9 @@ export default function App() {
             }),
             getRippleMeta: () => engineRef.current?.getRippleMeta() ?? null,
             runLiveWorkerTest: async (
-              testEngineMode: AiEngineMode = 'AUTO',
-              targetFrames = 30,
+              testEngineMode: AiEngineMode = 'GPU',
+              targetFrames = 24,
+              taskMode: TrackerTaskMode = 'HAND',
             ) => {
               const vid = videoRef.current;
               if (!vid) throw new Error('Video element missing');
@@ -871,6 +1004,7 @@ export default function App() {
                   benchClient.dispose();
                   resolve({
                     isWorker: meta.isWorker,
+                    taskMode: meta.taskMode,
                     completedFrames: count,
                     steadyAvgInferMs:
                       steadyCount > 0 ? Math.round((steadySumMs / steadyCount) * 10) / 10 : 0,
@@ -880,13 +1014,12 @@ export default function App() {
                   });
                 };
 
-                const timeoutId = window.setTimeout(finish, 12000);
+                const timeoutId = window.setTimeout(finish, 14000);
 
                 benchClient
                   .init(
                     (pkt) => {
                       count += 1;
-                      // Skip first 3 cold shader/WASM warmup frames to measure true steady-state inferMs
                       if (count > 3 && pkt.inferMs > 0) {
                         steadyCount += 1;
                         steadySumMs += pkt.inferMs;
@@ -899,11 +1032,13 @@ export default function App() {
                       }
                     },
                     testEngineMode,
+                    undefined,
+                    taskMode,
                   )
                   .then(() => {
                     timerId = window.setInterval(() => {
                       benchClient.submitFrame(vid, performance.now());
-                    }, 33);
+                    }, 16);
                   })
                   .catch((err) => {
                     window.clearTimeout(timeoutId);
@@ -920,12 +1055,13 @@ export default function App() {
               noteOpen: settingsRef.current.noteOpen,
               toolsOpen: toolsOpenRef.current,
               airDrawEnabled: settingsRef.current.airDrawEnabled,
+              graphicsQuality: settingsRef.current.graphicsQuality,
+              fpsTarget: settingsRef.current.fpsTarget,
               holoText: holoTextValueRef.current,
               engineStatus: engineStatusRef.current,
             }),
           };
         } else {
-          // Always boot with the standard system default camera
           const [camStream] = await Promise.all([
             openCameraStream(undefined, savedPreset),
             trackerClient.init(
@@ -934,6 +1070,7 @@ export default function App() {
               (delegate) => {
                 if (!cancelled) setActiveAiDelegate(delegate);
               },
+              initialTask,
             ),
           ]);
           stream = camStream;
@@ -948,6 +1085,7 @@ export default function App() {
 
         syncCanvases();
         prismEngine = new OpticalPrismEngine(glCanvas, cosmosCanvasRef.current);
+        prismEngine.setQuality(settingsRef.current.graphicsQuality);
         engineRef.current = prismEngine;
         mediaStreamRef.current = stream;
 
@@ -970,21 +1108,41 @@ export default function App() {
         }
         prismEngine.uploadVideoFrame(video);
 
+        // Glass Preloader compiles all 3D + Bloom + Dissolve + Runner shaders before reveal (0ms switch hitch)
+        prismEngine.prewarmCosmosNow();
+
         syncCanvases();
         setEngineStatus('ready');
 
         if (isTestMode) {
+          // 60Hz synthetic mock stream (both Hand & Full-Body Runner Pose)
           mockIntervalId = window.setInterval(() => {
             if (cancelled) return;
             const elapsedSec = (performance.now() - mockPoseStartRef.current) / 1000;
-            const mockLm = generateMockHands(mockPoseRef.current, elapsedSec);
-            onWorkerResult({
-              landmarks: mockLm,
-              aiFps: 30,
-              inferMs: 6,
-              delegate: 'CPU',
-            });
-          }, 33);
+            const curTask: TrackerTaskMode =
+              settingsRef.current.mode === 'RUNNER' && !settingsRef.current.airDrawEnabled
+                ? 'POSE'
+                : 'HAND';
+            if (curTask === 'POSE') {
+              onWorkerResult({
+                taskMode: 'POSE',
+                landmarks: [],
+                poseLandmarks: generateMockPose(mockPoseRef.current, elapsedSec),
+                aiFps: 60,
+                inferMs: 5,
+                delegate: 'GPU',
+              });
+            } else {
+              onWorkerResult({
+                taskMode: 'HAND',
+                landmarks: generateMockHands(mockPoseRef.current, elapsedSec),
+                poseLandmarks: null,
+                aiFps: 60,
+                inferMs: 5,
+                delegate: 'GPU',
+              });
+            }
+          }, 16);
         }
 
         const activeEngine = prismEngine;
@@ -993,11 +1151,29 @@ export default function App() {
 
         let usesRvfc = false;
         let lastFallbackVideoTime = -1;
+        let lastCamFrameMs = 0;
+        let camEmaDt = 1 / 60;
+        let lastCamDisplayMs = 0;
+
+        const recordCamCadence = (now: number) => {
+          if (lastCamFrameMs > 0) {
+            const cdt = Math.min(0.25, Math.max(0.004, (now - lastCamFrameMs) / 1000));
+            camEmaDt = camEmaDt * 0.85 + cdt * 0.15;
+          }
+          lastCamFrameMs = now;
+          if (now - lastCamDisplayMs >= FPS_UPDATE_INTERVAL_MS && camFpsTextRef.current) {
+            camFpsTextRef.current.textContent = String(
+              Math.min(120, Math.round(1 / Math.max(camEmaDt, 0.001))),
+            ).padStart(2, '0');
+            lastCamDisplayMs = now;
+          }
+        };
 
         if (typeof video.requestVideoFrameCallback === 'function') {
           usesRvfc = true;
           const onVideoFrame = (now: number) => {
             if (cancelled) return;
+            recordCamCadence(now);
             activeEngine.uploadVideoFrame(video);
             if (!isTestMode) {
               activeTracker.submitFrame(video, now);
@@ -1011,6 +1187,7 @@ export default function App() {
         let emaDt = 1 / 120;
         let lastFpsDisplayMs = lastFrameTime;
         let nextRenderTime = lastFrameTime;
+        let lastRunnerUiSyncMs = 0;
 
         let dwellMs = 0;
         let dwellCooldownUntil = 0;
@@ -1022,7 +1199,7 @@ export default function App() {
         let curTiltY = 0;
         let fistHoldSec = 0;
 
-        // Drift-Free 120 FPS Pro Cinema Render Loop (RTX 3050 45W Optimized)
+        // Max Refresh Rate Native Render Loop (Max Hz / 120 / 60 user selectable)
         const renderLoop = (now: number) => {
           if (cancelled) return;
           rafId = requestAnimationFrame(renderLoop);
@@ -1031,19 +1208,24 @@ export default function App() {
 
           if (!usesRvfc && video.readyState >= 2 && video.currentTime !== lastFallbackVideoTime) {
             lastFallbackVideoTime = video.currentTime;
+            recordCamCadence(now);
             activeEngine.uploadVideoFrame(video);
             if (!isTestMode) {
               activeTracker.submitFrame(video, now);
             }
           }
 
-          // Steady 120 FPS hardware pacing (8.33ms interval; passes through on 60Hz/120Hz cleanly)
-          if (now < nextRenderTime - 0.2) {
-            return;
-          }
-          nextRenderTime += TARGET_FPS_INTERVAL_MS;
-          if (now - nextRenderTime > 20) {
-            nextRenderTime = now + TARGET_FPS_INTERVAL_MS;
+          if (curSettings.fpsTarget !== 'MAX') {
+            const targetInterval = 1000 / curSettings.fpsTarget;
+            if (now < nextRenderTime - 0.25) {
+              return;
+            }
+            nextRenderTime += targetInterval;
+            if (now - nextRenderTime > 24) {
+              nextRenderTime = now + targetInterval;
+            }
+          } else {
+            nextRenderTime = now;
           }
 
           const dtSeconds = Math.min(Math.max((now - lastFrameTime) / 1000, 0.001), 0.1);
@@ -1053,7 +1235,7 @@ export default function App() {
           if (now - lastFpsDisplayMs >= FPS_UPDATE_INTERVAL_MS) {
             if (fpsTextRef.current) {
               fpsTextRef.current.textContent = String(
-                Math.min(144, Math.round(1 / Math.max(emaDt, 0.001))),
+                Math.min(240, Math.round(1 / Math.max(emaDt, 0.001))),
               ).padStart(2, '0');
             }
             lastFpsDisplayMs = now;
@@ -1066,6 +1248,11 @@ export default function App() {
           const viewH = glCanvasEl.height;
           const vidW = video.videoWidth || 1280;
           const vidH = video.videoHeight || 720;
+
+          const pipCtx =
+            curSettings.mode === 'RUNNER' && !curSettings.airDrawEnabled
+              ? pipCanvasRef.current?.getContext('2d') ?? null
+              : null;
 
           const renderStartMs = performance.now();
           const frameOut = activeEngine.renderFrame(
@@ -1081,6 +1268,9 @@ export default function App() {
             overlayCtx,
             swipeIndicatorRef.current,
             handPacketSeq,
+            latestPose,
+            pipCtx,
+            video,
           );
           const renderCostMs = performance.now() - renderStartMs;
           if (isTestMode) {
@@ -1095,6 +1285,26 @@ export default function App() {
           if (statusLabel !== lastDisplayedStatus && modeTextRef.current) {
             modeTextRef.current.textContent = statusLabel;
             lastDisplayedStatus = statusLabel;
+          }
+
+          // Throttled Runner HUD state sync (~15Hz — crisp score/countdown updates with near-zero React cost)
+          if (frameOut.activeMode === 'RUNNER' && now - lastRunnerUiSyncMs >= 65) {
+            lastRunnerUiSyncMs = now;
+            const snap = activeEngine.getRunnerSnapshot();
+            if (snap) {
+              setRunnerHud((prev) =>
+                prev.phase === snap.phase &&
+                prev.score === snap.score &&
+                prev.coins === snap.coins &&
+                prev.bestScore === snap.bestScore &&
+                prev.speedMultiplier === snap.speedMultiplier &&
+                prev.countdownNum === snap.countdownNum &&
+                prev.hasBody === snap.hasBody &&
+                Math.abs(prev.handsUpProgress - snap.handsUpProgress) < 0.04
+                  ? prev
+                  : snap,
+              );
+            }
           }
 
           // 3D Hologram Text ±15 deg parallax + 1.5s Fist-to-Clear
@@ -1123,7 +1333,7 @@ export default function App() {
             fistHoldSec = 0;
           }
 
-          // VisionOS Magnetic Air-Cursor (+14px hitbox, 38% pull, 0.65s dwell, 800ms cooldown)
+          // VisionOS Magnetic Air-Cursor
           if (clickPulse > 0) {
             clickPulse = Math.max(0, clickPulse - dtSeconds * 3.8);
           }
@@ -1265,9 +1475,15 @@ export default function App() {
     syncCanvases,
   ]);
 
+  const isRunnerMode = settings.mode === 'RUNNER' && !settings.airDrawEnabled;
+
   return (
-    <main className="relative h-screen w-screen overflow-hidden bg-black">
-      {/* Hidden raw video source (rendered through WebGL2 Cinema Clean FBO) */}
+    <main
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={handleDropGlb}
+      className="relative h-screen w-screen overflow-hidden bg-black"
+    >
+      {/* Hidden raw video source */}
       <video
         ref={videoRef}
         playsInline
@@ -1278,19 +1494,19 @@ export default function App() {
         }`}
       />
 
-      {/* Layer 1: WebGL2 2-Pass Cinema Clean FBO + Optical Polygons */}
+      {/* Layer 1: WebGL2 Webcam Pass-Through (+ Ultra Liquid Glass Ripple) + 3D Crystal Lenses */}
       <canvas
         ref={glCanvasRef}
         className="pointer-events-none fixed inset-0 z-10 h-full w-full"
       />
 
-      {/* Layer 2: Three.js WebGL2 + UnrealBloomPass (Cosmos & 3D Volumetric Lightning) */}
+      {/* Layer 2: Shared Three.js Stage (Cosmos + 3D Lightning + 15k Fluid + Ultra 3D Runner) */}
       <canvas
         ref={cosmosCanvasRef}
         className="pointer-events-none fixed inset-0 z-10 h-full w-full"
       />
 
-      {/* Layer 3: Transparent Canvas 2D (Mystic, Cyber HUD, Air Draw, Trails & Planet Tags) */}
+      {/* Layer 3: Transparent Canvas 2D (Mystic 3D Runes, Cyber HUD, Speed Lines, Air Draw & Trails) */}
       <canvas
         ref={glowCanvasRef}
         className="pointer-events-none fixed inset-0 z-10 h-full w-full"
@@ -1305,6 +1521,124 @@ export default function App() {
         />
       )}
 
+      {/* Runner Pro Studio Mono HUD (Top-Right) */}
+      {isRunnerMode && (
+        <div
+          data-testid="runner-hud"
+          className="pointer-events-auto fixed top-4 right-4 z-20 flex items-center gap-2"
+        >
+          <div className="inline-flex h-7 items-center gap-3 rounded-full border border-white/12 bg-neutral-950/65 px-3.5 font-mono text-[11px] text-white/90 tabular-nums backdrop-blur-2xl">
+            <span>
+              <span className="text-white/45">SCORE </span>
+              {String(runnerHud.score).padStart(5, '0')}
+            </span>
+            <span className="text-white/20">·</span>
+            <span className="text-amber-300">
+              <span className="text-white/45">COINS </span>
+              {runnerHud.coins}
+            </span>
+            <span className="text-white/20">·</span>
+            <span className="text-cyan-300">x{runnerHud.speedMultiplier.toFixed(1)}</span>
+            <span className="text-white/20">·</span>
+            <span className="text-white/70">
+              <span className="text-white/45">BEST </span>
+              {runnerHud.bestScore}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => engineRef.current?.recalibrateRunner()}
+            title="Recalibrate standing posture"
+            className="inline-flex h-7 items-center gap-1.5 rounded-full border border-white/12 bg-neutral-950/65 px-2.5 font-mono text-[10px] font-medium text-white/80 backdrop-blur-2xl transition-colors hover:bg-white/15 hover:text-white"
+          >
+            <Crosshair className="h-3 w-3" aria-hidden="true" />
+            <span>Recalibrate</span>
+          </button>
+        </div>
+      )}
+
+      {/* Runner Bottom-Right Camera PiP Body Guide (220x124px, shifts left if Inspector is open) */}
+      {isRunnerMode && (
+        <div
+          data-testid="runner-pip"
+          className={`pointer-events-none fixed bottom-20 z-20 overflow-hidden rounded-xl border border-white/15 bg-neutral-950/75 shadow-[0_12px_36px_rgba(0,0,0,0.6)] backdrop-blur-xl transition-[right] duration-250 ${
+            toolsOpen ? 'right-[316px]' : 'right-4'
+          }`}
+          style={{ width: 220, height: 124 }}
+        >
+          <canvas ref={pipCanvasRef} width={220} height={124} className="block h-full w-full" />
+        </div>
+      )}
+
+      {/* Runner Start / 3-2-1 Calibration / Game Over Frosted Overlay */}
+      {isRunnerMode && runnerHud.phase !== 'PLAYING' && (
+        <div className="pointer-events-none fixed inset-0 z-20 flex items-center justify-center p-4">
+          {runnerHud.phase === 'CALIBRATING' ? (
+            <div className="flex flex-col items-center gap-2 rounded-2xl border border-white/15 bg-neutral-950/70 px-8 py-6 text-center backdrop-blur-2xl">
+              <span className="font-mono text-[10px] tracking-[0.2em] text-cyan-300 uppercase">
+                Calibrating Shoulders · Stand Center
+              </span>
+              <span className="font-mono text-6xl font-semibold text-white tabular-nums">
+                {runnerHud.countdownNum || 1}
+              </span>
+            </div>
+          ) : (
+            <div className="pointer-events-auto flex w-full max-w-xs flex-col items-center gap-3.5 rounded-2xl border border-white/14 bg-neutral-950/75 px-6 py-5 text-center shadow-[0_24px_64px_rgba(0,0,0,0.6)] backdrop-blur-2xl">
+              <span className="font-mono text-[10px] tracking-[0.18em] text-white/50 uppercase">
+                {runnerHud.phase === 'GAME_OVER' ? 'Run Complete' : 'Full-Body Neon Runner'}
+              </span>
+              <h2 className="text-lg font-semibold tracking-tight text-white">
+                {runnerHud.phase === 'GAME_OVER'
+                  ? `Score ${runnerHud.score}`
+                  : 'Neon Subway Runner'}
+              </h2>
+              {runnerHud.phase === 'GAME_OVER' ? (
+                <p className="font-mono text-xs text-white/70 tabular-nums">
+                  COINS {runnerHud.coins} · BEST {runnerHud.bestScore}
+                </p>
+              ) : (
+                <p className="text-xs leading-relaxed text-white/60">
+                  Lean or step Left / Center / Right · Jump over barriers · Duck under laser gates.
+                </p>
+              )}
+
+              <button
+                type="button"
+                data-testid="runner-start-btn"
+                onClick={() => engineRef.current?.startRunner(false)}
+                className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-full bg-white px-5 text-xs font-medium text-black transition-colors hover:bg-white/90"
+              >
+                {runnerHud.phase === 'GAME_OVER' ? (
+                  <>
+                    <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Play Again</span>
+                  </>
+                ) : (
+                  <>
+                    <Play className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
+                    <span>Start Run</span>
+                  </>
+                )}
+              </button>
+
+              {/* Touchless Overhead Both-Hands-Up Hold Indicator (1.2s) */}
+              <div className="flex w-full flex-col gap-1.5 pt-0.5">
+                <div className="flex items-center justify-between font-mono text-[10px] text-white/50">
+                  <span>Or raise both hands up</span>
+                  <span>{Math.round(runnerHud.handsUpProgress * 100)}%</span>
+                </div>
+                <div className="h-1 w-full overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className="h-full rounded-full bg-cyan-400 transition-[width] duration-75"
+                    style={{ width: `${Math.round(runnerHud.handsUpProgress * 100)}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       <PrismBar
         settings={settings}
         onSettingsChange={handleSettingsChange}
@@ -1316,6 +1650,7 @@ export default function App() {
         onSelectCamera={handleSelectCamera}
         onSelectCameraPreset={handleSelectCameraPreset}
         fpsTextRef={fpsTextRef}
+        camFpsTextRef={camFpsTextRef}
         aiFpsTextRef={aiFpsTextRef}
         modeTextRef={modeTextRef}
         uiRootRef={uiRootRef}
@@ -1340,7 +1675,7 @@ export default function App() {
             <Loader2 className="h-5 w-5 animate-spin text-white/85" aria-hidden="true" />
             <h1 className="text-sm font-medium text-white">Starting VisionArcade</h1>
             <p className="text-xs text-white/55">
-              Initializing hand tracking worker, WebGL2 cinema pipeline, and 3D stage.
+              Compiling Ultra Cinema shaders, GPU Worker pipeline, and 3D stage.
             </p>
           </div>
         </div>

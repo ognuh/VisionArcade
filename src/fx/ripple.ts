@@ -1,11 +1,15 @@
+import type { GraphicsQuality } from '../types/vision';
 import type { HandPose2D } from './types';
 
-const SIM_W = 384;
-const SIM_H = 216;
-const MAX_IMPULSES = 32;
+const ULTRA_SIM_W = 512;
+const ULTRA_SIM_H = 288;
+const HIGH_SIM_W = 384;
+const HIGH_SIM_H = 216;
+
+const MAX_IMPULSES = 48;
 const MAX_RINGS = 2;
-const FIXED_STEP_SEC = 1 / 120; // 120Hz fixed physics timestep
-const DAMPING_120HZ = 0.9918; // Smooth 16-bit half-float wave persistence (~0.984^0.5)
+const FIXED_STEP_SEC = 1 / 120; // 120Hz fixed physics timestep — immune to 60/120/144Hz FPS jitter
+const DAMPING_120HZ = 0.9924; // Ultra silky 16-bit half-float wave persistence
 const FIST_HOLD_MIN_SEC = 0.12;
 const SHOCKWAVE_COOLDOWN_SEC = 0.7;
 
@@ -57,7 +61,7 @@ void main() {
   float avg = (hL + hR + hU + hD) * 0.20 + (hTL + hTR + hBL + hBR) * 0.05;
   float nextH = (2.0 * avg - prevH) * uDamping;
 
-  // Continuous Catmull-Rom sub-step splats along palm & index fingertip trajectories
+  // Continuous Catmull-Rom 6-8 sub-step splats along palm & index fingertip trajectories
   vec2 aspect = vec2(16.0 / 9.0, 1.0);
   for (int i = 0; i < ${MAX_IMPULSES}; i++) {
     if (i >= uImpulseCount) break;
@@ -75,18 +79,18 @@ void main() {
     vec4 ring = uRings[k];
     if (ring.w > 0.002) {
       float d = length((vUv - ring.xy) * aspect);
-      float crest = exp(-pow((d - ring.z) / 0.034, 2.0));
-      float trough = exp(-pow((d - max(0.0, ring.z - 0.046)) / 0.028, 2.0));
-      nextH += (crest * 1.0 - trough * 0.52) * ring.w;
+      float crest = exp(-pow((d - ring.z) / 0.032, 2.0));
+      float trough = exp(-pow((d - max(0.0, ring.z - 0.044)) / 0.026, 2.0));
+      nextH += (crest * 1.05 - trough * 0.56) * ring.w;
     }
   }
 
   // Soft absorbing border prevents artificial box reflections
-  float edgeX = smoothstep(0.0, 0.038, vUv.x) * smoothstep(1.0, 0.962, vUv.x);
-  float edgeY = smoothstep(0.0, 0.038, vUv.y) * smoothstep(1.0, 0.962, vUv.y);
+  float edgeX = smoothstep(0.0, 0.035, vUv.x) * smoothstep(1.0, 0.965, vUv.x);
+  float edgeY = smoothstep(0.0, 0.035, vUv.y) * smoothstep(1.0, 0.965, vUv.y);
   nextH *= mix(0.92, 1.0, edgeX * edgeY);
 
-  nextH = clamp(nextH, -1.8, 1.8);
+  nextH = clamp(nextH, -1.9, 1.9);
   fragColor = vec4(nextH * uScale + uBias, currH * uScale + uBias, 0.0, 1.0);
 }
 `;
@@ -213,10 +217,11 @@ export interface RippleSimMeta {
 }
 
 /**
- * True 16-bit Half-Float WebGL2 Liquid Glass Wave Simulator (384x216, 120Hz Fixed Timestep):
+ * True Ultra 16-bit Half-Float WebGL2 Liquid Glass Wave Simulator (512x288 Ultra / 384x216 High):
  * - RGBA16F ping-pong FBOs (EXT_color_buffer_float / EXT_color_buffer_half_float + verified FBO completeness)
- * - Catmull-Rom 4–6 sub-step spline splatting for unbroken liquid wakes at 120 FPS
- * - Isotropic 8-neighbor wave PDE + Fist->Open Shockwave Ring bursts
+ * - 120Hz Fixed-Timestep wave PDE prevents oscillation or amplitude blow-up at 60/120/144Hz
+ * - Catmull-Rom 6-8 sub-step spline splatting for unbroken liquid-glass trails at fast hand speeds
+ * - Fist -> Open full-screen Shockwave Ring burst
  */
 export class RippleWaveSim {
   private gl: WebGL2RenderingContext;
@@ -226,8 +231,12 @@ export class RippleWaveSim {
   private texs: [WebGLTexture, WebGLTexture];
   private fbos: [WebGLFramebuffer, WebGLFramebuffer];
   private readIdx: 0 | 1 = 0;
+  private hasFloatExt: boolean;
   private useFloat: boolean;
   private fboComplete = false;
+  private simW = ULTRA_SIM_W;
+  private simH = ULTRA_SIM_H;
+  private quality: GraphicsQuality = 'ULTRA';
   private stepAcc = 0;
 
   private locs: {
@@ -249,17 +258,16 @@ export class RippleWaveSim {
     { palm: createTrailHistory(), tip: createTrailHistory(), fistHoldSec: 0, shockCooldownSec: 0 },
   ];
   private rings: [ActiveRing, ActiveRing] = [
-    { active: false, u: 0.5, v: 0.5, age: 0, duration: 0.50 },
-    { active: false, u: 0.5, v: 0.5, age: 0, duration: 0.50 },
+    { active: false, u: 0.5, v: 0.5, age: 0, duration: 0.52 },
+    { active: false, u: 0.5, v: 0.5, age: 0, duration: 0.52 },
   ];
   private nextRingSlot: 0 | 1 = 0;
 
   constructor(gl: WebGL2RenderingContext) {
     this.gl = gl;
-    const hasFloatExt =
+    this.hasFloatExt =
       Boolean(gl.getExtension('EXT_color_buffer_float')) ||
       Boolean(gl.getExtension('EXT_color_buffer_half_float'));
-    // Enable linear filtering on half-float if extension exposed (core in WebGL2 on desktop GPUs)
     gl.getExtension('OES_texture_half_float_linear');
     gl.getExtension('OES_texture_float_linear');
 
@@ -294,26 +302,36 @@ export class RippleWaveSim {
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-    // Attempt RGBA16F first and verify FRAMEBUFFER_COMPLETE; fall back cleanly to RGBA8 if unsupported
-    this.useFloat = hasFloatExt;
-    const pair = this.allocateFboPair(this.useFloat);
+    this.useFloat = this.hasFloatExt;
+    const initial = this.buildCheckedFboPair(this.simW, this.simH);
+    this.texs = initial.texs;
+    this.fbos = initial.fbos;
+    this.fboComplete = initial.complete;
+    this.clear();
+  }
+
+  private buildCheckedFboPair(w: number, h: number): {
+    texs: [WebGLTexture, WebGLTexture];
+    fbos: [WebGLFramebuffer, WebGLFramebuffer];
+    complete: boolean;
+  } {
+    const gl = this.gl;
+    this.useFloat = this.hasFloatExt;
+    const pair = this.allocateFboPair(this.useFloat, w, h);
     if (!pair.complete && this.useFloat) {
       pair.texs.forEach((t) => gl.deleteTexture(t));
       pair.fbos.forEach((f) => gl.deleteFramebuffer(f));
       this.useFloat = false;
-      const fallback = this.allocateFboPair(false);
-      this.texs = fallback.texs;
-      this.fbos = fallback.fbos;
-      this.fboComplete = fallback.complete;
-    } else {
-      this.texs = pair.texs;
-      this.fbos = pair.fbos;
-      this.fboComplete = pair.complete;
+      return this.allocateFboPair(false, w, h);
     }
-    this.clear();
+    return pair;
   }
 
-  private allocateFboPair(useHalfFloat: boolean): {
+  private allocateFboPair(
+    useHalfFloat: boolean,
+    w: number,
+    h: number,
+  ): {
     texs: [WebGLTexture, WebGLTexture];
     fbos: [WebGLFramebuffer, WebGLFramebuffer];
     complete: boolean;
@@ -328,9 +346,9 @@ export class RippleWaveSim {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       if (useHalfFloat) {
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, SIM_W, SIM_H, 0, gl.RGBA, gl.HALF_FLOAT, null);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
       } else {
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, SIM_W, SIM_H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       }
       gl.bindTexture(gl.TEXTURE_2D, null);
       return tex;
@@ -353,12 +371,33 @@ export class RippleWaveSim {
     return { texs: [t0, t1], fbos: [f0.fbo, f1.fbo], complete: f0.ok && f1.ok };
   }
 
+  public setQuality(quality: GraphicsQuality): void {
+    if (this.quality === quality) return;
+    this.quality = quality;
+    const targetW = quality === 'ULTRA' ? ULTRA_SIM_W : HIGH_SIM_W;
+    const targetH = quality === 'ULTRA' ? ULTRA_SIM_H : HIGH_SIM_H;
+    if (targetW === this.simW && targetH === this.simH) return;
+
+    const gl = this.gl;
+    this.texs.forEach((t) => gl.deleteTexture(t));
+    this.fbos.forEach((f) => gl.deleteFramebuffer(f));
+
+    this.simW = targetW;
+    this.simH = targetH;
+    const rebuilt = this.buildCheckedFboPair(this.simW, this.simH);
+    this.texs = rebuilt.texs;
+    this.fbos = rebuilt.fbos;
+    this.fboComplete = rebuilt.complete;
+    this.readIdx = 0;
+    this.clear();
+  }
+
   public getMeta(): RippleSimMeta {
     return {
       isHalfFloat: this.useFloat,
       fboComplete: this.fboComplete,
-      simWidth: SIM_W,
-      simHeight: SIM_H,
+      simWidth: this.simW,
+      simHeight: this.simH,
     };
   }
 
@@ -367,7 +406,7 @@ export class RippleWaveSim {
     const clearVal = this.useFloat ? 0.0 : 0.5;
     for (let i = 0; i < 2; i += 1) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbos[i]);
-      gl.viewport(0, 0, SIM_W, SIM_H);
+      gl.viewport(0, 0, this.simW, this.simH);
       gl.clearColor(clearVal, clearVal, 0, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
     }
@@ -392,13 +431,13 @@ export class RippleWaveSim {
   }
 
   public getTexelSize(): [number, number] {
-    return [1.0 / SIM_W, 1.0 / SIM_H];
+    return [1.0 / this.simW, 1.0 / this.simH];
   }
 
-  /** Fixed-timestep 120Hz GPU wave solver with Catmull-Rom 4–6 sub-step spline splatting. */
+  /** Fixed-timestep 120Hz GPU wave solver with Catmull-Rom 6-8 sub-step spline splatting. */
   public step(hands: HandPose2D[], dt: number, viewW: number, viewH: number): void {
     const safeDt = Math.min(Math.max(dt, 0.002), 0.05);
-    this.stepAcc = Math.min(this.stepAcc + safeDt, FIXED_STEP_SEC * 2.5);
+    this.stepAcc = Math.min(this.stepAcc + safeDt, FIXED_STEP_SEC * 3.0);
 
     const invW = 1 / Math.max(viewW, 1);
     const invH = 1 / Math.max(viewH, 1);
@@ -428,17 +467,17 @@ export class RippleWaveSim {
       pushTrailPoint(hist, u, v);
 
       if (!hadPrev) {
-        pushImpulse(u, v, baseRadius * 1.15, 0.16);
+        pushImpulse(u, v, baseRadius * 1.15, 0.17);
         return;
       }
 
       const dist = Math.hypot(u - prevU, v - prevV);
       const speed = dist / safeDt;
 
-      if (dist > 0.0012) {
-        // 4-6 smooth Catmull-Rom sub-steps along segment -> unbroken ribbon even at high hand speed
-        const subSteps = Math.min(6, Math.max(4, Math.ceil(dist / 0.009)));
-        const amp = Math.min(maxAmp, 0.045 + speed * 0.095) / Math.sqrt(subSteps);
+      if (dist > 0.001) {
+        // 6-8 smooth Catmull-Rom sub-steps along trajectory -> unbroken liquid-glass wake at 144Hz
+        const subSteps = Math.min(8, Math.max(6, Math.ceil(dist / 0.007)));
+        const amp = Math.min(maxAmp, 0.048 + speed * 0.102) / Math.sqrt(subSteps);
         for (let s = 1; s <= subSteps; s += 1) {
           const f = s / subSteps;
           const su = catmullRom1D(hist.u0, hist.u1, hist.u2, hist.u3, f);
@@ -484,16 +523,16 @@ export class RippleWaveSim {
           rSlot.u = palmU;
           rSlot.v = palmV;
           rSlot.age = 0;
-          rSlot.duration = 0.50;
+          rSlot.duration = 0.52;
           this.nextRingSlot = this.nextRingSlot === 0 ? 1 : 0;
           st.shockCooldownSec = SHOCKWAVE_COOLDOWN_SEC;
-          pushImpulse(palmU, palmV, 0.082, 0.68);
+          pushImpulse(palmU, palmV, 0.085, 0.74);
         }
         st.fistHoldSec = 0;
       }
 
-      splatCatmullRom(st.palm, palmU, palmV, 0.044, 0.28, 0.014);
-      splatCatmullRom(st.tip, tipU, tipV, 0.028, 0.24, 0.0);
+      splatCatmullRom(st.palm, palmU, palmV, 0.042, 0.30, 0.014);
+      splatCatmullRom(st.tip, tipU, tipV, 0.026, 0.25, 0.0);
     }
 
     for (let slot = 0; slot < 2; slot += 1) {
@@ -510,10 +549,10 @@ export class RippleWaveSim {
       }
     }
 
-    // Run 1..2 Fixed-Timestep 120Hz Wave PDE Passes
+    // Run 1..3 Fixed-Timestep 120Hz Wave PDE Passes
     const gl = this.gl;
     let subPasses = 0;
-    while (this.stepAcc >= FIXED_STEP_SEC && subPasses < 2) {
+    while (this.stepAcc >= FIXED_STEP_SEC && subPasses < 3) {
       this.stepAcc -= FIXED_STEP_SEC;
 
       for (let k = 0; k < MAX_RINGS; k += 1) {
@@ -529,8 +568,8 @@ export class RippleWaveSim {
             const ease = 1 - Math.pow(1 - t, 1.85);
             this.ringBuf[o] = r.u;
             this.ringBuf[o + 1] = r.v;
-            this.ringBuf[o + 2] = 0.04 + ease * 1.18;
-            this.ringBuf[o + 3] = (1 - t) * (1 - t) * 0.24;
+            this.ringBuf[o + 2] = 0.04 + ease * 1.24;
+            this.ringBuf[o + 3] = (1 - t) * (1 - t) * 0.26;
           }
         } else {
           this.ringBuf[o + 3] = 0;
@@ -541,18 +580,17 @@ export class RippleWaveSim {
 
       gl.useProgram(this.program);
       gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbos[writeIdx]);
-      gl.viewport(0, 0, SIM_W, SIM_H);
+      gl.viewport(0, 0, this.simW, this.simH);
       gl.disable(gl.BLEND);
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.texs[this.readIdx]);
       gl.uniform1i(this.locs.uPrevSim, 0);
-      gl.uniform2f(this.locs.uTexel, 1.0 / SIM_W, 1.0 / SIM_H);
+      gl.uniform2f(this.locs.uTexel, 1.0 / this.simW, 1.0 / this.simH);
       gl.uniform1f(this.locs.uDamping, DAMPING_120HZ);
       gl.uniform1f(this.locs.uBias, this.useFloat ? 0.0 : 0.5);
       gl.uniform1f(this.locs.uInvScale, this.useFloat ? 1.0 : 2.0);
       gl.uniform1f(this.locs.uScale, this.useFloat ? 1.0 : 0.5);
-      // Inject hand impulses on first substep only so fast frames never double-inject
       gl.uniform1i(this.locs.uImpulseCount, subPasses === 0 ? impulseCount : 0);
       if (subPasses === 0 && impulseCount > 0) {
         gl.uniform4fv(this.locs.uImpulses, this.impulseBuf);

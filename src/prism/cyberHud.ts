@@ -29,6 +29,8 @@ function modeNeonColor(mode: PrismModeId): string {
       return '#67e8f9';
     case 'FLUID':
       return '#818cf8';
+    case 'RUNNER':
+      return '#38bdf8';
     default:
       return '#22d3ee';
   }

@@ -2,6 +2,7 @@ export interface Landmark3D {
   x: number;
   y: number;
   z: number;
+  visibility?: number;
 }
 
 export type GestureType = 'IDLE' | 'OPEN' | 'PINCH' | 'FIST' | 'POINT';
@@ -15,7 +16,13 @@ export interface GpuInfo {
   fallbackReason?: string;
 }
 
-export type AiEngineMode = 'AUTO' | 'GPU' | 'CPU';
+export type AiEngineMode = 'GPU' | 'AUTO' | 'CPU';
+
+export type TrackerTaskMode = 'HAND' | 'POSE';
+
+export type GraphicsQuality = 'ULTRA' | 'HIGH';
+
+export type FpsTarget = 'MAX' | 120 | 60;
 
 export type PrismModeId =
   | 'AUTO'
@@ -26,7 +33,8 @@ export type PrismModeId =
   | 'LIGHTNING'
   | 'MYSTIC'
   | 'RIPPLE'
-  | 'FLUID';
+  | 'FLUID'
+  | 'RUNNER';
 
 export type CycleModeId = Exclude<PrismModeId, 'AUTO'>;
 
@@ -39,11 +47,12 @@ export const MODE_CYCLE_ORDER: readonly CycleModeId[] = [
   'MYSTIC',
   'RIPPLE',
   'FLUID',
+  'RUNNER',
 ];
 
 export type AirDrawColorId = 'CYAN' | 'MAGENTA' | 'GREEN' | 'GOLD';
 
-export type CameraPresetId = 'AUTO' | '720P' | '1080P';
+export type CameraPresetId = 'AUTO' | '720P60' | '720P30' | '1080P60';
 
 export interface CameraDeviceItem {
   deviceId: string;
@@ -60,4 +69,6 @@ export interface PrismSettings {
   noteOpen: boolean;
   sfxEnabled: boolean;
   aiEngineMode: AiEngineMode;
+  graphicsQuality: GraphicsQuality;
+  fpsTarget: FpsTarget;
 }

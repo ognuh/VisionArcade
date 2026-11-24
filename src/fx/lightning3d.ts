@@ -8,7 +8,7 @@ const VERTS_PER_RIBBON = PTS_PER_RIBBON * 2;
 const TRIS_PER_RIBBON = (PTS_PER_RIBBON - 1) * 2;
 const TOTAL_VERTS = MAX_RIBBONS * VERTS_PER_RIBBON;
 const TOTAL_INDICES = MAX_RIBBONS * TRIS_PER_RIBBON * 3;
-const SPARK_POOL = 220;
+const SPARK_POOL = 260;
 const FINGERTIP_IDS = [4, 8, 12, 16, 20];
 
 // Continuous 2D gradient noise for smooth organic time-evolving Catmull-Rom spline displacement
@@ -89,17 +89,17 @@ void main() {
   float d = abs(vUv.y - 0.5) * 2.0; // 0 at filament center, 1 at ribbon edge
   if (d > 1.0) discard;
 
-  float pulse = 0.90 + 0.10 * sin(vUv.x * 22.0 - uTime * 26.0);
-  float core = exp(-d * d * 32.0);
-  float cyanField = exp(-d * d * 7.5);
-  float violetAura = exp(-d * d * 2.4);
+  float pulse = 0.90 + 0.10 * sin(vUv.x * 26.0 - uTime * 30.0);
+  float core = exp(-d * d * 42.0);
+  float cyanField = exp(-d * d * 8.2);
+  float violetAura = exp(-d * d * 2.5);
 
   vec3 col =
-    vec3(0.45, 0.14, 0.96) * violetAura * 0.44 +
-    vec3(0.10, 0.72, 1.18) * cyanField * 0.85 +
-    vec3(1.22, 1.38, 1.58) * core * 0.88;
+    vec3(0.52, 0.16, 1.12) * violetAura * 0.48 +
+    vec3(0.12, 0.86, 1.44) * cyanField * 0.95 +
+    vec3(1.58, 1.78, 2.08) * core * 1.05;
 
-  float alpha = clamp((violetAura * 0.34 + cyanField * 0.58 + core) * vAlpha * pulse, 0.0, 1.0);
+  float alpha = clamp((violetAura * 0.36 + cyanField * 0.62 + core) * vAlpha * pulse, 0.0, 1.0);
   gl_FragColor = vec4(col * pulse, alpha);
 }
 `;
@@ -767,9 +767,9 @@ export class Lightning3DEngine {
           this.burstTimer = 0;
           this.burstWorldX = wP.x;
           this.burstWorldY = wP.y;
-          this.edgeFlashAlpha = 0.78 + this.chargeLevel * 0.22;
-          for (let s = 0; s < 95; s += 1) {
-            this.spawnSpark3D(wP.x, wP.y, 1.55 + this.chargeLevel * 0.65);
+          this.edgeFlashAlpha = 0.85 + this.chargeLevel * 0.25;
+          for (let s = 0; s < 120; s += 1) {
+            this.spawnSpark3D(wP.x, wP.y, 1.65 + this.chargeLevel * 0.72);
           }
           this.audio.playThunderDischarge(0.8 + this.chargeLevel * 0.5);
         }

@@ -1,9 +1,11 @@
 import type { HandLandmarker } from '@mediapipe/tasks-vision';
-import type { AiEngineMode, GpuInfo, Landmark3D } from '../types/vision';
+import type { AiEngineMode, GpuInfo, Landmark3D, TrackerTaskMode } from '../types/vision';
 import { createHandTracker } from './handTracker';
 
 export interface TrackingResultPacket {
+  taskMode: TrackerTaskMode;
   landmarks: Landmark3D[][];
+  poseLandmarks: Landmark3D[] | null;
   aiFps: number;
   inferMs: number;
   delegate: 'GPU' | 'CPU';
@@ -14,13 +16,10 @@ const AI_H = 180;
 const FPS_WINDOW_SIZE = 20;
 
 /**
- * Direct Zero-Copy HandTracker Client (320x180 Hardware Resize + Latest-Frame 1-Slot Queue):
+ * Direct Zero-Copy Unified Hand / Pose Tracker Client (320x180 Hardware Resize + Latest-Frame 1-Slot Queue):
+ * - Mutually exclusive taskMode: 'HAND' for VFX modes, 'POSE' (pose_landmarker_lite) for Runner mode.
  * - Captures hardware-scaled 320x180 ImageBitmap on main thread and transfers zero-copy to Worker.
- * - Latest-Frame Slot prevents the 30 -> 15 FPS halving when Worker is briefly busy: keeps only
- *   the newest ImageBitmap (closing superseded ones immediately -> 0 leaks) and fires it the
- *   instant the Worker returns a result.
- * - Supports Auto-Benchmark Delegate (GPU -> CPU WASM SIMD fallback when GPU queue saturates at 120 FPS)
- *   plus manual AUTO / GPU / CPU override.
+ * - Latest-Frame Slot eliminates 30 -> 15 FPS halving and strictly closes superseded bitmaps (0 leaks).
  */
 export class HandTrackerClient {
   private worker: Worker | null = null;
@@ -32,16 +31,15 @@ export class HandTrackerClient {
   private isCapturing = false;
   private disposed = false;
 
-  // Latest-Frame Slot (depth 1): holds at most one newest waiting ImageBitmap
   private pendingBitmap: ImageBitmap | null = null;
   private pendingTs = 0;
 
-  private engineMode: AiEngineMode = 'AUTO';
+  private engineMode: AiEngineMode = 'GPU';
+  private taskMode: TrackerTaskMode = 'HAND';
   private activeDelegate: 'GPU' | 'CPU' = 'GPU';
   private avgInferMs = 0;
   private lastDetectTs = 0;
 
-  // Dedicated Worker completion timestamp ring buffer for accurate AI FPS readout
   private completionTimes = new Float64Array(FPS_WINDOW_SIZE);
   private completionCursor = 0;
   private completionCount = 0;
@@ -57,12 +55,14 @@ export class HandTrackerClient {
 
   async init(
     onResult: (packet: TrackingResultPacket) => void,
-    initialEngineMode: AiEngineMode = 'AUTO',
+    initialEngineMode: AiEngineMode = 'GPU',
     onDelegateChange?: (delegate: 'GPU' | 'CPU') => void,
+    initialTaskMode: TrackerTaskMode = 'HAND',
   ): Promise<GpuInfo> {
     this.onResultCallback = onResult;
     this.onDelegateChangeCallback = onDelegateChange ?? null;
     this.engineMode = initialEngineMode;
+    this.taskMode = initialTaskMode;
 
     const canUseWorker =
       typeof Worker !== 'undefined' &&
@@ -71,7 +71,7 @@ export class HandTrackerClient {
 
     if (canUseWorker) {
       try {
-        const gpuInfo = await this.initWorker(initialEngineMode);
+        const gpuInfo = await this.initWorker(initialEngineMode, initialTaskMode);
         this.gpuInfo = gpuInfo;
         return gpuInfo;
       } catch (err) {
@@ -81,7 +81,6 @@ export class HandTrackerClient {
       }
     }
 
-    // Automatic Main-Thread fallback
     const tracker = await createHandTracker(false);
     if (this.disposed) {
       tracker.landmarker.close();
@@ -106,14 +105,24 @@ export class HandTrackerClient {
     }
   }
 
+  public setTaskMode(mode: TrackerTaskMode): void {
+    if (this.taskMode === mode) return;
+    this.taskMode = mode;
+    if (this.worker && !this.disposed) {
+      this.worker.postMessage({ type: 'SET_TASK_MODE', taskMode: mode });
+    }
+  }
+
   public getTelemetry(): {
     isWorker: boolean;
+    taskMode: TrackerTaskMode;
     delegate: 'GPU' | 'CPU';
     avgInferMs: number;
     aiFps: number;
   } {
     return {
       isWorker: this.worker !== null,
+      taskMode: this.taskMode,
       delegate: this.activeDelegate,
       avgInferMs: Math.round(this.avgInferMs * 10) / 10,
       aiFps: this.computeAiFps(),
@@ -135,11 +144,10 @@ export class HandTrackerClient {
   private computeAiFps(): number {
     if (this.completionCount < 2) return 30;
     const newestIdx = (this.completionCursor - 1 + FPS_WINDOW_SIZE) % FPS_WINDOW_SIZE;
-    const oldestIdx =
-      this.completionCount < FPS_WINDOW_SIZE ? 0 : this.completionCursor;
+    const oldestIdx = this.completionCount < FPS_WINDOW_SIZE ? 0 : this.completionCursor;
     const spanMs = this.completionTimes[newestIdx] - this.completionTimes[oldestIdx];
     if (spanMs <= 1) return 30;
-    return Math.min(60, Math.round(((this.completionCount - 1) * 1000) / spanMs));
+    return Math.min(120, Math.round(((this.completionCount - 1) * 1000) / spanMs));
   }
 
   private dispatchToWorker(bitmap: ImageBitmap, timestampMs: number): void {
@@ -183,7 +191,10 @@ export class HandTrackerClient {
     }
   }
 
-  private initWorker(initialMode: AiEngineMode): Promise<GpuInfo> {
+  private initWorker(
+    initialMode: AiEngineMode,
+    initialTask: TrackerTaskMode,
+  ): Promise<GpuInfo> {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL('../workers/handTracker.worker.ts', import.meta.url), {
         type: 'module',
@@ -228,15 +239,16 @@ export class HandTrackerClient {
           const now = performance.now();
           const inferMs = Number(msg.inferMs ?? 0);
           const delegate = (msg.delegate ?? this.activeDelegate) as 'GPU' | 'CPU';
+          const pktTask = (msg.taskMode ?? this.taskMode) as TrackerTaskMode;
           this.activeDelegate = delegate;
           const aiFps = this.recordCompletion(now, inferMs);
 
-          // Immediately fire the newest queued frame BEFORE invoking main-thread callbacks
-          // so Worker stays saturated at full 30 FPS cadence without half-stepping!
           this.flushPendingToWorker();
 
           this.onResultCallback?.({
+            taskMode: pktTask,
             landmarks: (msg.landmarks ?? []) as Landmark3D[][],
+            poseLandmarks: (msg.poseLandmarks ?? null) as Landmark3D[] | null,
             aiFps,
             inferMs,
             delegate,
@@ -244,14 +256,10 @@ export class HandTrackerClient {
         }
       };
 
-      worker.postMessage({ type: 'INIT', engineMode: initialMode });
+      worker.postMessage({ type: 'INIT', engineMode: initialMode, taskMode: initialTask });
     });
   }
 
-  /**
-   * Extracts a hardware-resized 320x180 ImageBitmap and either dispatches immediately
-   * or replaces the single Latest-Frame Slot (closing any older waiting ImageBitmap).
-   */
   submitFrame(video: HTMLVideoElement, timestampMs: number): void {
     if (this.disposed || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
       return;
@@ -280,7 +288,6 @@ export class HandTrackerClient {
           if (!this.isProcessing) {
             this.dispatchToWorker(bitmap, timestampMs);
           } else {
-            // Latest-Frame Slot: close stale waiting bitmap, keep only the newest frame
             this.clearPendingBitmap();
             this.pendingBitmap = bitmap;
             this.pendingTs = timestampMs;
@@ -292,7 +299,6 @@ export class HandTrackerClient {
       return;
     }
 
-    // Main-thread fallback
     if (this.fallbackLandmarker && this.fallbackCanvas && this.fallbackCtx && !this.isProcessing) {
       this.isProcessing = true;
       window.setTimeout(() => {
@@ -311,7 +317,9 @@ export class HandTrackerClient {
           const aiFps = this.recordCompletion(now, inferMs);
 
           this.onResultCallback?.({
+            taskMode: 'HAND',
             landmarks: (result.landmarks ?? []) as Landmark3D[][],
+            poseLandmarks: null,
             aiFps,
             inferMs,
             delegate: this.activeDelegate,

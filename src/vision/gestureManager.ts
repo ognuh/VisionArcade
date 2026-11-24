@@ -137,6 +137,19 @@ export class GestureManager {
     };
 
     const { hands, gestures, nowMs, settings, activeMode, isHoveringUi, cosmosBlackHoleBusy } = ctx;
+    // Full-body Runner mode owns the stage — disable hand Air Swipe while playing Runner
+    if (activeMode === 'RUNNER') {
+      this.clearArms();
+      this.awaitingSettle = false;
+      return {
+        owner: 'MODE_GESTURE',
+        swipeDir: 0,
+        swipeIndicator: emptyIndicator,
+        allowModeGestures: true,
+        allowAirDraw: false,
+      };
+    }
+
     if (hands.length === 0) {
       this.clearArms();
       this.awaitingSettle = false;

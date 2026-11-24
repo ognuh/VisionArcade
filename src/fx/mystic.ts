@@ -280,33 +280,37 @@ export class MysticFx {
         ctx.restore();
       }
 
-      // Step 2: Geometric Rune Ring with 12 minimalist glyphs traces around
+      // Step 2: Dual Counter-Rotating 3D Geometric Rune Rings with 16 sharp HDR glyphs
       if (pRune > 0.01) {
         ctx.save();
-        ctx.rotate(this.elapsed * 1.8);
+        ctx.rotate(this.elapsed * 1.85);
         const rRune = baseR * 0.48;
-        this.drawMultiPassArc(ctx, rRune, Math.PI * 2 * pRune, 5.5, 1.35, '#ff8c00', '#fff3b0', renderAlpha);
+        this.drawMultiPassArc(ctx, rRune, Math.PI * 2 * pRune, 6.5, 1.6, '#ff6d00', '#ffffff', renderAlpha);
+        this.drawMultiPassArc(ctx, rRune * 1.14, Math.PI * 2 * pRune, 4.0, 1.0, '#ff8c00', '#fde047', renderAlpha * 0.85);
 
-        const visibleGlyphs = Math.floor(pRune * 12);
+        const visibleGlyphs = Math.floor(pRune * 16);
         if (visibleGlyphs > 0) {
-          ctx.strokeStyle = '#fff3b0';
-          ctx.lineWidth = 1.25;
-          ctx.globalAlpha = 0.9 * renderAlpha;
+          ctx.strokeStyle = '#fffbeb';
+          ctx.lineWidth = 1.45;
+          ctx.globalAlpha = 0.95 * renderAlpha;
           ctx.beginPath();
           for (let g = 0; g < visibleGlyphs; g += 1) {
-            const a = (g * Math.PI * 2) / 12;
-            const gx = Math.cos(a) * rRune;
-            const gy = Math.sin(a) * rRune;
+            const a = (g * Math.PI * 2) / 16;
+            const gx = Math.cos(a) * (rRune * 1.07);
+            const gy = Math.sin(a) * (rRune * 1.07);
             const nx = -Math.sin(a);
             const ny = Math.cos(a);
             const rx = Math.cos(a);
             const ry = Math.sin(a);
-            ctx.moveTo(gx - nx * 6, gy - ny * 6);
-            ctx.lineTo(gx + rx * 6, gy + ry * 6);
-            ctx.lineTo(gx + nx * 6, gy + ny * 6);
+            ctx.moveTo(gx - nx * 5.5, gy - ny * 5.5);
+            ctx.lineTo(gx + rx * 6.5, gy + ry * 6.5);
+            ctx.lineTo(gx + nx * 5.5, gy + ny * 5.5);
             if (g % 2 === 0) {
-              ctx.moveTo(gx - rx * 4, gy - ry * 4);
-              ctx.lineTo(gx + rx * 5, gy + ry * 5);
+              ctx.moveTo(gx - rx * 4.5, gy - ry * 4.5);
+              ctx.lineTo(gx + rx * 5.5, gy + ry * 5.5);
+            } else {
+              ctx.moveTo(gx - nx * 3.5 + rx * 2, gy - ny * 3.5 + ry * 2);
+              ctx.lineTo(gx + nx * 3.5 + rx * 2, gy + ny * 3.5 + ry * 2);
             }
           }
           ctx.stroke();
@@ -384,24 +388,25 @@ export class MysticFx {
 
             const tvx = -Math.sin(a) * scaleX;
             const tvy = Math.cos(a) * scaleY;
-            const spd = 125 + Math.random() * 235;
+            const spd = 75 + Math.random() * 145;
             this.spawnEmber(
               wx,
               wy,
               (tvx * cosR - tvy * sinR) * spd,
-              (tvx * sinR + tvy * cosR) * spd,
+              (tvx * sinR + tvy * cosR) * spd - (55 + Math.random() * 65),
             );
           }
         }
       }
     }
 
-    // Update & blit 120 depth-scaled embers
+    // Update & blit depth-scaled gently rising warm ember sparks
     for (let i = 0; i < EMBER_POOL_SIZE; i += 1) {
       if (this.sLife[i] >= this.sMax[i]) continue;
       this.sLife[i] += dt;
       if (this.sLife[i] >= this.sMax[i]) continue;
-      this.svy[i] += 220 * dt;
+      this.svy[i] -= 115 * dt; // Gentle buoyant upward lift
+      this.svx[i] += Math.sin(this.elapsed * 5.2 + i * 1.7) * 42 * dt;
       this.sx[i] += this.svx[i] * this.sz[i] * dt;
       this.sy[i] += this.svy[i] * this.sz[i] * dt;
 

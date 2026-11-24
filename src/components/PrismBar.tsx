@@ -5,6 +5,7 @@ import {
   CloudLightning,
   Contrast,
   Flame,
+  Footprints,
   Layers,
   Orbit,
   Scan,
@@ -19,6 +20,8 @@ import type {
   AirDrawColorId,
   CameraDeviceItem,
   CameraPresetId,
+  FpsTarget,
+  GraphicsQuality,
   PrismModeId,
   PrismSettings,
 } from '../types/vision';
@@ -34,6 +37,7 @@ interface PrismBarProps {
   onSelectCamera: (deviceId: string) => void;
   onSelectCameraPreset: (preset: CameraPresetId) => void;
   fpsTextRef: RefObject<HTMLSpanElement | null>;
+  camFpsTextRef: RefObject<HTMLSpanElement | null>;
   aiFpsTextRef: RefObject<HTMLSpanElement | null>;
   modeTextRef: RefObject<HTMLSpanElement | null>;
   uiRootRef: RefObject<HTMLDivElement | null>;
@@ -56,17 +60,30 @@ const MODES: { id: PrismModeId; label: string; keyHint: string; icon: typeof Sca
   { id: 'MYSTIC', label: 'Mystic', keyHint: '7', icon: Shield },
   { id: 'RIPPLE', label: 'Ripple', keyHint: '8', icon: Waves },
   { id: 'FLUID', label: 'Fluid', keyHint: '9', icon: Sparkles },
+  { id: 'RUNNER', label: 'Runner', keyHint: '0', icon: Footprints },
 ];
 
 const CAMERA_PRESETS: { id: CameraPresetId; label: string }[] = [
   { id: 'AUTO', label: 'Auto' },
-  { id: '720P', label: '720p' },
-  { id: '1080P', label: '1080p' },
+  { id: '720P60', label: '720p 60' },
+  { id: '720P30', label: '720p 30' },
+  { id: '1080P60', label: '1080p 60' },
+];
+
+const QUALITY_MODES: { id: GraphicsQuality; label: string }[] = [
+  { id: 'ULTRA', label: 'Ultra' },
+  { id: 'HIGH', label: 'High' },
+];
+
+const FPS_TARGETS: { id: FpsTarget; label: string }[] = [
+  { id: 'MAX', label: 'Max Hz' },
+  { id: 120, label: '120' },
+  { id: 60, label: '60' },
 ];
 
 const AI_ENGINE_MODES: { id: AiEngineMode; label: string }[] = [
-  { id: 'AUTO', label: 'Auto' },
   { id: 'GPU', label: 'GPU' },
+  { id: 'AUTO', label: 'Auto' },
   { id: 'CPU', label: 'CPU' },
 ];
 
@@ -80,7 +97,7 @@ interface ToggleRowProps {
 
 function StudioToggleRow({ label, checked, onToggle }: ToggleRowProps) {
   return (
-    <div className="flex items-center justify-between py-1">
+    <div className="flex items-center justify-between py-0.5">
       <span className="text-xs font-normal text-white/85">{label}</span>
       <button
         type="button"
@@ -115,6 +132,7 @@ export function PrismBar({
   onSelectCamera,
   onSelectCameraPreset,
   fpsTextRef,
+  camFpsTextRef,
   aiFpsTextRef,
   modeTextRef,
   uiRootRef,
@@ -175,6 +193,7 @@ export function PrismBar({
       else if (e.key === '7') onSettingsChange({ mode: 'MYSTIC', airDrawEnabled: false });
       else if (e.key === '8') onSettingsChange({ mode: 'RIPPLE', airDrawEnabled: false });
       else if (e.key === '9') onSettingsChange({ mode: 'FLUID', airDrawEnabled: false });
+      else if (e.key === '0') onSettingsChange({ mode: 'RUNNER', airDrawEnabled: false });
       else if (e.key === 'ArrowRight') {
         e.preventDefault();
         onStepMode(1);
@@ -211,9 +230,12 @@ export function PrismBar({
 
   return (
     <>
-      {/* Top-Left Minimalist Telemetry Pill */}
+      {/* Top-Left Minimalist Pro Telemetry Pill */}
       <header className="pointer-events-none fixed top-4 left-4 z-20">
-        <div className="pointer-events-auto inline-flex h-7 items-center gap-2 rounded-full border border-white/12 bg-neutral-950/60 px-3 font-mono text-[11px] backdrop-blur-2xl">
+        <div
+          data-testid="telemetry-pill"
+          className="pointer-events-auto inline-flex h-7 items-center gap-2 rounded-full border border-white/12 bg-neutral-950/60 px-3 font-mono text-[11px] backdrop-blur-2xl"
+        >
           <span className="font-sans text-[11px] font-semibold tracking-tight text-white/95">
             VisionArcade
           </span>
@@ -232,8 +254,14 @@ export function PrismBar({
           <span className="text-white/25" aria-hidden="true">
             ·
           </span>
-          <span className="text-white/55 tabular-nums">
-            AI <span ref={aiFpsTextRef}>30</span>
+          <span className="text-white/60 tabular-nums">
+            CAM <span ref={camFpsTextRef}>60</span>
+          </span>
+          <span className="text-white/25" aria-hidden="true">
+            ·
+          </span>
+          <span className="text-white/65 tabular-nums">
+            AI <span ref={aiFpsTextRef}>60</span> ({activeAiDelegate})
           </span>
           <span className="text-white/25" aria-hidden="true">
             ·
@@ -270,15 +298,15 @@ export function PrismBar({
             aria-label="Studio Settings"
             data-testid="studio-inspector"
             onPointerMove={onDockActivity}
-            className="inspector-panel-enter pointer-events-auto fixed right-4 bottom-20 z-30 flex w-[288px] flex-col gap-3 rounded-2xl border border-white/12 bg-neutral-950/60 p-3.5 shadow-[0_24px_64px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
+            className="inspector-panel-enter pointer-events-auto fixed right-4 bottom-20 z-30 flex max-h-[calc(100vh-110px)] w-[292px] flex-col gap-2.5 overflow-y-auto rounded-2xl border border-white/12 bg-neutral-950/65 p-3.5 shadow-[0_24px_64px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
           >
-            {/* Section 1: Camera Source */}
-            <section className="flex flex-col gap-2 border-b border-white/8 pb-3">
+            {/* Section 1: Camera Source & Max FPS Presets */}
+            <section className="flex flex-col gap-2 border-b border-white/8 pb-2.5">
               <div className="flex items-center justify-between">
                 <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
                   Camera Source
                 </h2>
-                <span className="font-mono text-[10px] text-white/35">Preset</span>
+                <span className="font-mono text-[10px] text-white/35">60 FPS Ready</span>
               </div>
 
               <div className="relative">
@@ -312,8 +340,8 @@ export function PrismBar({
 
               <div
                 role="group"
-                aria-label="Resolution Preset"
-                className="grid grid-cols-3 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
+                aria-label="Camera FPS Preset"
+                className="grid grid-cols-2 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
               >
                 {CAMERA_PRESETS.map((preset) => {
                   const active = cameraPreset === preset.id;
@@ -337,8 +365,81 @@ export function PrismBar({
               </div>
             </section>
 
-            {/* Section 2: AI Engine Delegate Selector */}
-            <section className="flex flex-col gap-2 border-b border-white/8 pb-3">
+            {/* Section 2: Performance & Graphics Quality */}
+            <section className="flex flex-col gap-2 border-b border-white/8 pb-2.5">
+              <div className="flex items-center justify-between">
+                <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+                  Graphics Quality
+                </h2>
+                <span className="font-mono text-[10px] text-white/40">
+                  {settings.graphicsQuality === 'ULTRA' ? '15K · 512p' : '9K · 384p'}
+                </span>
+              </div>
+
+              <div
+                role="group"
+                aria-label="Graphics Quality"
+                className="grid grid-cols-2 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
+              >
+                {QUALITY_MODES.map((q) => {
+                  const active = settings.graphicsQuality === q.id;
+                  return (
+                    <button
+                      key={q.id}
+                      type="button"
+                      data-air-clickable="true"
+                      aria-pressed={active}
+                      onClick={() => onSettingsChange({ graphicsQuality: q.id })}
+                      className={`inline-flex h-6 items-center justify-center rounded-md text-[11px] font-medium transition-colors duration-200 ${
+                        active
+                          ? 'bg-white text-black shadow-xs'
+                          : 'text-white/60 hover:text-white'
+                      }`}
+                    >
+                      {q.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="flex items-center justify-between pt-0.5">
+                <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+                  FPS Target
+                </h2>
+                <span className="font-mono text-[10px] text-white/40">
+                  {settings.fpsTarget === 'MAX' ? 'Native Hz' : `${settings.fpsTarget} FPS`}
+                </span>
+              </div>
+
+              <div
+                role="group"
+                aria-label="FPS Target"
+                className="grid grid-cols-3 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
+              >
+                {FPS_TARGETS.map((t) => {
+                  const active = settings.fpsTarget === t.id;
+                  return (
+                    <button
+                      key={String(t.id)}
+                      type="button"
+                      data-air-clickable="true"
+                      aria-pressed={active}
+                      onClick={() => onSettingsChange({ fpsTarget: t.id })}
+                      className={`inline-flex h-6 items-center justify-center rounded-md text-[11px] font-medium transition-colors duration-200 ${
+                        active
+                          ? 'bg-white text-black shadow-xs'
+                          : 'text-white/60 hover:text-white'
+                      }`}
+                    >
+                      {t.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
+            {/* Section 3: AI Engine Delegate Selector */}
+            <section className="flex flex-col gap-1.5 border-b border-white/8 pb-2.5">
               <div className="flex items-center justify-between">
                 <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
                   AI Engine
@@ -373,9 +474,9 @@ export function PrismBar({
               </div>
             </section>
 
-            {/* Section 3: Studio Controls */}
+            {/* Section 4: Studio Controls */}
             <section className="flex flex-col gap-1">
-              <h2 className="mb-1 text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+              <h2 className="mb-0.5 text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
                 Studio Controls
               </h2>
               <StudioToggleRow
@@ -399,15 +500,15 @@ export function PrismBar({
                 onToggle={() => onSettingsChange({ mirrored: !settings.mirrored })}
               />
               <StudioToggleRow
-                label="Thunder SFX"
+                label="SFX Audio"
                 checked={settings.sfxEnabled}
                 onToggle={() => onSettingsChange({ sfxEnabled: !settings.sfxEnabled })}
               />
             </section>
 
-            {/* Section 3: Air Draw Palette (revealed smoothly when Air Draw is active) */}
+            {/* Air Draw Palette (revealed when Air Draw is active) */}
             {settings.airDrawEnabled && (
-              <section className="flex flex-col gap-2 border-t border-white/8 pt-3">
+              <section className="flex flex-col gap-2 border-t border-white/8 pt-2.5">
                 <div className="flex items-center justify-between">
                   <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
                     Air Draw Palette
@@ -446,7 +547,7 @@ export function PrismBar({
               </section>
             )}
 
-            {/* Optional Note 3D Quick Clear when Note 3D is open */}
+            {/* Optional Note 3D Quick Clear */}
             {settings.noteOpen && (
               <section className="flex items-center justify-between border-t border-white/8 pt-2.5">
                 <span className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
@@ -506,7 +607,7 @@ export function PrismBar({
                   }`}
                 >
                   <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                  <span className="hidden sm:inline">{m.label}</span>
+                  <span className="hidden lg:inline">{m.label}</span>
                 </button>
               );
             })}

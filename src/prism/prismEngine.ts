@@ -6,15 +6,18 @@ import {
   renderTrailOutline,
 } from '../fx/prism';
 import { RippleWaveSim, type RippleSimMeta } from '../fx/ripple';
+import type { RunnerHudSnapshot } from '../fx/runnerGame';
 import { TransitionManager } from '../fx/transitionManager';
 import type { HandPose2D, Point2D, RenderPolygon } from '../fx/types';
 import type {
   AirDrawColorId,
   CycleModeId,
   GestureType,
+  GraphicsQuality,
   Landmark3D,
   PrismSettings,
 } from '../types/vision';
+import { BodyController, drawRunnerPipGuide } from '../vision/bodyController';
 import type { SwipeIndicatorState } from '../vision/gestureManager';
 import { OneEuroAxis } from '../vision/smoothing';
 import { drawCyberneticHandHud } from './cyberHud';
@@ -165,31 +168,31 @@ void main() {
       vec2 grad = vec2(gx, gy) * 0.25;
 
       // Smooth deep UV refraction + soft R/G/B Chromatic Aberration along wave slope
-      vec2 disp = grad * 0.105 * uRippleStrength;
+      vec2 disp = grad * 0.122 * uRippleStrength;
       if (uMirrored > 0.5) disp.x = -disp.x;
 
-      float rCh = texture(uVideo, clamp(uv + disp * 1.15, 0.002, 0.998)).r;
+      float rCh = texture(uVideo, clamp(uv + disp * 1.18, 0.002, 0.998)).r;
       float gCh = texture(uVideo, clamp(uv + disp,        0.002, 0.998)).g;
-      float bCh = texture(uVideo, clamp(uv + disp * 0.85, 0.002, 0.998)).b;
+      float bCh = texture(uVideo, clamp(uv + disp * 0.82, 0.002, 0.998)).b;
       vec3 refracted = vec3(rCh, gCh, bCh);
 
-      // Glossy Fresnel specular highlights + subtle aquatic caustics on convex crests
-      vec3 N = normalize(vec3(-grad.x * 7.5, -grad.y * 7.5, 1.0));
+      // Glossy Fresnel specular highlights + shimmering aquatic caustics on convex crests
+      vec3 N = normalize(vec3(-grad.x * 8.4, -grad.y * 8.4, 1.0));
       vec3 V = vec3(0.0, 0.0, 1.0);
       vec3 L1 = normalize(vec3(-0.38, 0.48, 0.79));
       vec3 L2 = normalize(vec3(0.45, -0.35, 0.82));
 
-      float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0) * uRippleStrength;
-      float spec1 = pow(max(dot(N, normalize(L1 + V)), 0.0), 56.0) * 0.72;
-      float spec2 = pow(max(dot(N, normalize(L2 + V)), 0.0), 32.0) * 0.28;
+      float fresnel = pow(1.0 - max(dot(N, V), 0.0), 2.8) * uRippleStrength;
+      float spec1 = pow(max(dot(N, normalize(L1 + V)), 0.0), 64.0) * 0.82;
+      float spec2 = pow(max(dot(N, normalize(L2 + V)), 0.0), 36.0) * 0.34;
       float spec = (spec1 + spec2) * uRippleStrength;
 
       float lap = max(0.0, hC * 4.0 - (hML + hMR + hTC + hBC));
-      float caustics = smoothstep(0.012, 0.14, lap) * 0.24 * uRippleStrength;
+      float caustics = (smoothstep(0.010, 0.12, lap) * 0.28 + smoothstep(0.04, 0.22, lap) * 0.16) * uRippleStrength;
 
       vec3 glassLight =
-        vec3(0.92, 0.97, 1.0) * spec +
-        vec3(0.45, 0.82, 1.0) * (fresnel * 0.34 + caustics);
+        vec3(0.95, 0.98, 1.0) * spec +
+        vec3(0.48, 0.86, 1.0) * (fresnel * 0.38 + caustics);
 
       fragColor = vec4(clamp(refracted + glassLight, 0.0, 1.0), 1.0);
       return;
@@ -199,7 +202,7 @@ void main() {
     return;
   }
 
-  // Mode 0: 3D Beveled Liquid Glass Crystal Lens (Convex center magnification + Beveled edge refraction)
+  // Mode 0: 3D Beveled Liquid Glass Crystal Lens (Convex magnification + Frosted micro-blur + Beveled edge refraction)
   if (uShaderType == 0) {
     vec2 aspect = vec2(uViewAspect, 1.0);
     vec2 pA = vScreenUv * aspect;
@@ -223,43 +226,53 @@ void main() {
         minDist = d;
         vec2 edgeDir = ab / sqrt(lenSq);
         vec2 n = vec2(-edgeDir.y, edgeDir.x);
-        // Orient normal inward toward lens center
         if (dot(cA - closest, n) < 0.0) n = -n;
         bestInNormal = n;
       }
     }
 
     // Smooth optical bevel ramp along the crystal borders (0 = clear convex dome, 1 = sharp beveled edge)
-    float bevel = 1.0 - smoothstep(0.0, 0.046, minDist);
+    float bevel = 1.0 - smoothstep(0.0, 0.052, minDist);
     float bevelSq = bevel * bevel;
 
     // 1. Subtle convex crystal magnification in the clear center
     vec2 toCenter = vScreenUv - uLensCenter;
-    vec2 convexShift = -toCenter * 0.095 * (1.0 - bevel * 0.5);
+    vec2 convexShift = -toCenter * 0.115 * (1.0 - bevel * 0.45);
 
     // 2. Strong beveled liquid-glass refraction bending light around the 4 edges
-    vec2 bevelShift = (-bestInNormal / aspect) * bevelSq * 0.046;
+    vec2 bevelShift = (-bestInNormal / aspect) * bevelSq * 0.054;
     vec2 totalShift = convexShift + bevelShift;
     if (uMirrored > 0.5) totalShift.x = -totalShift.x;
 
     // 3. Prismatic chromatic aberration along the beveled crystal facets
-    vec2 caShift = (-bestInNormal / aspect) * bevelSq * 0.011;
+    vec2 caShift = (-bestInNormal / aspect) * bevelSq * 0.013;
     if (uMirrored > 0.5) caShift.x = -caShift.x;
 
+    vec2 baseUv = clamp(uv + totalShift, 0.002, 0.998);
     float rCh = texture(uVideo, clamp(uv + totalShift + caShift, 0.002, 0.998)).r;
-    float gCh = texture(uVideo, clamp(uv + totalShift,           0.002, 0.998)).g;
+    float gCh = texture(uVideo, baseUv).g;
     float bCh = texture(uVideo, clamp(uv + totalShift - caShift, 0.002, 0.998)).b;
     vec3 refracted = vec3(rCh, gCh, bCh);
 
-    // 4. 3D bevel surface lighting, top-left specular catchlight & crystal rim sheen
-    vec3 bevelN = normalize(vec3(-bestInNormal * bevel * 1.45, 1.0));
-    vec3 lightDir = normalize(vec3(-0.45, -0.55, 0.70));
-    float spec = pow(max(dot(bevelN, lightDir), 0.0), 34.0) * bevel * 0.46;
-    float rimGlow = smoothstep(0.68, 0.99, bevel) * 0.28;
-    float domeSheen = pow(max(0.0, 1.0 - length((vScreenUv - uLensCenter) * 2.4)), 2.0) * 0.04;
+    // 4. Subtle 5-tap frosted VisionOS optical glass micro-blur
+    vec2 bOff = uVideoTexel * (1.6 + bevel * 1.4);
+    vec3 frosted =
+      refracted * 0.46 +
+      (texture(uVideo, clamp(baseUv + vec2( bOff.x,  bOff.y), 0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2(-bOff.x,  bOff.y), 0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2( bOff.x, -bOff.y), 0.002, 0.998)).rgb +
+       texture(uVideo, clamp(baseUv + vec2(-bOff.x, -bOff.y), 0.002, 0.998)).rgb) * 0.135;
+    vec3 glassSample = mix(refracted, frosted, 0.34 + bevel * 0.22);
 
-    vec3 crystal = refracted * 1.04 + vec3(0.012, 0.025, 0.042) * (0.35 + bevel * 0.65);
-    crystal += vec3(0.95, 0.98, 1.0) * (spec + rimGlow + domeSheen);
+    // 5. 3D bevel surface lighting, top-left specular catchlight & crisp white crystal rim sheen
+    vec3 bevelN = normalize(vec3(-bestInNormal * bevel * 1.55, 1.0));
+    vec3 lightDir = normalize(vec3(-0.45, -0.55, 0.70));
+    float spec = pow(max(dot(bevelN, lightDir), 0.0), 38.0) * bevel * 0.54;
+    float rimGlow = smoothstep(0.66, 0.99, bevel) * 0.36;
+    float domeSheen = pow(max(0.0, 1.0 - length((vScreenUv - uLensCenter) * 2.4)), 2.0) * 0.055;
+
+    vec3 crystal = glassSample * 1.05 + vec3(0.015, 0.028, 0.048) * (0.38 + bevel * 0.62);
+    crystal += vec3(0.96, 0.99, 1.0) * (spec + rimGlow + domeSheen);
     fragColor = vec4(clamp(crystal, 0.0, 1.0), 0.98 * uTint.a);
     return;
   }
@@ -680,6 +693,7 @@ export class OpticalPrismEngine {
   private cosmosFx: Cosmos3DEngine | null = null;
   private mysticFx = new MysticFx();
   private rippleSim: RippleWaveSim;
+  private bodyController = new BodyController();
   private glassSpring = new GlassLensSpring();
   private lensVertScratch = new Float32Array(8);
   private rippleStrength = 0;
@@ -794,6 +808,7 @@ export class OpticalPrismEngine {
 
   resetSmoothing(): void {
     this.interpolator.reset();
+    this.bodyController.reset();
     this.cosmosFx?.reset();
     this.cosmosFx?.resetLightning();
     this.cosmosFx?.resetFluid();
@@ -801,6 +816,41 @@ export class OpticalPrismEngine {
     this.rippleSim.clear();
     this.glassSpring.reset();
     this.trailBuffer = [];
+  }
+
+  setQuality(quality: GraphicsQuality): void {
+    this.rippleSim.setQuality(quality);
+    this.cosmosFx?.setQuality(quality);
+  }
+
+  getFluidParticleCount(): number {
+    return this.cosmosFx?.getFluidParticleCount() ?? 15000;
+  }
+
+  startRunner(skipCountdown = false): void {
+    this.cosmosFx?.startRunner(() => this.bodyController.beginCalibrationSample(), skipCountdown);
+  }
+
+  recalibrateRunner(): void {
+    this.bodyController.recalibrateNow();
+  }
+
+  resetRunner(): void {
+    this.cosmosFx?.resetRunner();
+  }
+
+  getRunnerSnapshot(): RunnerHudSnapshot | null {
+    return this.cosmosFx?.getRunnerSnapshot() ?? null;
+  }
+
+  async loadCustomGlbFromFile(file: File): Promise<void> {
+    if (!this.cosmosFx) return;
+    const buf = await file.arrayBuffer();
+    await this.cosmosFx.loadCustomGlbFromBuffer(buf, file.name.replace(/\.glb$/i, ''));
+  }
+
+  clearCustomGlb(): void {
+    this.cosmosFx?.clearCustomGlb();
   }
 
   getRippleMeta(): RippleSimMeta {
@@ -1190,13 +1240,63 @@ export class OpticalPrismEngine {
     overlayCtx: CanvasRenderingContext2D | null,
     swipeIndicator?: SwipeIndicatorState,
     handPacketSeq = 0,
+    rawPose: Landmark3D[] | null = null,
+    pipCtx: CanvasRenderingContext2D | null = null,
+    videoEl: HTMLVideoElement | null = null,
   ): FrameOutput {
     this.elapsed += dt;
     this.cosmosFx?.setLightningSfxEnabled(settings.sfxEnabled);
+    this.setQuality(settings.graphicsQuality);
 
     const gl = this.gl;
     if (overlayCtx) {
       overlayCtx.clearRect(0, 0, viewW, viewH);
+    }
+
+    // Exclusive Full-Body 3D Neon Subway Runner Mode (zero wasted hand-VFX work)
+    if (settings.mode === 'RUNNER' && !settings.airDrawEnabled) {
+      this.transitionMgr.setMode('RUNNER');
+      this.transitionMgr.update(dt);
+      const snapBefore = this.cosmosFx?.getRunnerSnapshot();
+      const allowAutoIdle = !snapBefore || snapBefore.phase === 'READY';
+      const bodyState = this.bodyController.update(rawPose, dt, settings.mirrored, allowAutoIdle);
+
+      this.cosmosFx?.renderStage({
+        cosmosActive: false,
+        cosmosFade: 0,
+        lightningActive: false,
+        lightningFade: 0,
+        lightningEnter: 0,
+        fluidActive: false,
+        fluidFade: 0,
+        runnerActive: true,
+        bodyState,
+        onBeginRunnerCalibration: () => this.bodyController.beginCalibrationSample(),
+        onFinishRunnerCalibration: () => this.bodyController.finishCalibrationSample(),
+        hands: [],
+        dt,
+        viewW,
+        viewH,
+        overlayCtx,
+      });
+
+      if (pipCtx) {
+        drawRunnerPipGuide(
+          pipCtx,
+          videoEl,
+          bodyState,
+          settings.mirrored,
+          pipCtx.canvas.width,
+          pipCtx.canvas.height,
+        );
+      }
+
+      return {
+        activeMode: 'RUNNER',
+        indexTipPx: null,
+        palmScreenNorm: null,
+        isLeadFist: false,
+      };
     }
 
     const [coverX, coverY] = computeCoverScale(viewW, viewH, videoW, videoH);
