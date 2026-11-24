@@ -6,17 +6,55 @@ import { PrismBar } from './components/PrismBar';
 import { OpticalPrismEngine } from './prism/prismEngine';
 import {
   MODE_CYCLE_ORDER,
+  type CameraDeviceItem,
+  type CameraPresetId,
   type CycleModeId,
   type GestureType,
-  type GpuInfo,
   type Landmark3D,
   type PrismSettings,
 } from './types/vision';
-import { AirSwipeDetector } from './vision/airSwipe';
-import { FingerSnapDetector } from './vision/fingerSnap';
 import { classifyHandGesture, GestureStabilizer } from './vision/gesture';
+import { GestureManager, type SwipeIndicatorState } from './vision/gestureManager';
 import { HandBlinkDetector } from './vision/handBlink';
 import { HandTrackerClient, type LightingStatus } from './vision/handTrackerClient';
+import {
+  createMockCameraStream,
+  generateMockHands,
+  type MockPoseId,
+} from './vision/mockHands';
+
+interface VisionTestBridge {
+  setPose: (pose: MockPoseId) => void;
+  setMode: (mode: PrismSettings['mode']) => void;
+  setNoteOpen: (open: boolean) => void;
+  setToolsOpen: (open: boolean) => void;
+  setAirDraw: (enabled: boolean) => void;
+  prewarmCosmos: () => void;
+  resetPerf: () => void;
+  getPerf: () => {
+    avgFps: number;
+    maxRenderMs: number;
+    avgRenderMs: number;
+    samples: number;
+  };
+  getHoveredUiItem: () => string | null;
+  getState: () => {
+    mode: PrismSettings['mode'];
+    activeMode: CycleModeId;
+    pose: MockPoseId;
+    noteOpen: boolean;
+    toolsOpen: boolean;
+    airDrawEnabled: boolean;
+    holoText: string;
+    engineStatus: EngineStatus;
+  };
+}
+
+declare global {
+  interface Window {
+    __VISION_TEST__?: VisionTestBridge;
+  }
+}
 
 type EngineStatus = 'loading' | 'ready' | 'error';
 
@@ -30,43 +68,98 @@ interface CachedButtonRect {
   cy: number;
 }
 
+const CAMERA_PRESET_STORAGE_KEY = 'visionarcade.cameraPreset';
+const SFX_STORAGE_KEY = 'visionarcade.sfxEnabled';
+const LEGACY_STORAGE_KEYS = [
+  'visionarcade.arcadeHighScore',
+  'visionarcade.faceMaskMode',
+  'visionarcade.faceMaskStrength',
+  'visionarcade.fpsCap',
+];
+
 const DWELL_TRIGGER_MS = 650;
 const DWELL_COOLDOWN_MS = 800;
 const DOCK_AUTO_FADE_MS = 2500;
 const MAGNETIC_HIT_PADDING_PX = 14;
 const MAGNETIC_PULL = 0.38;
 const FPS_UPDATE_INTERVAL_MS = 500;
-const EMA_ALPHA = 2 / 31; // 30-frame EMA smoothing
-const MODE_TOAST_MS = 900;
-
-// Full-Screen White Flash timing: 40ms peak white + 380ms exponential decay
-const FLASH_HOLD_SEC = 0.04;
-const FLASH_DECAY_SEC = 0.38;
-const FLASH_TOTAL_SEC = FLASH_HOLD_SEC + FLASH_DECAY_SEC;
+const EMA_ALPHA = 2 / 31;
+const MODE_TOAST_MS = 1000;
+const LOCKED_FPS_INTERVAL_MS = 1000 / 60;
 
 const TARGET_HOLO_PHRASE = 'xin chào tôi là hưng';
 const FIST_CLEAR_HOLD_SEC = 1.5;
 
 const MODE_DISPLAY_NAME: Record<CycleModeId, string> = {
-  GLASS: 'MODE // GLASS TRIANGLE',
-  THERMAL: 'MODE // THERMAL MASK',
-  PRISM: 'MODE // CHROMATIC PRISM',
-  GALAXY: 'MODE // GALAXY 3D',
-  LIGHTNING: 'MODE // PLASMA LIGHTNING',
-  MYSTIC: 'MODE // MYSTIC SHIELD',
+  GLASS: 'GLASS',
+  THERMAL: 'THERMAL',
+  PRISM: 'PRISM',
+  COSMOS: 'COSMOS',
+  LIGHTNING: 'LIGHTNING',
+  MYSTIC: 'MYSTIC',
 };
 
-const INITIAL_SETTINGS: PrismSettings = {
-  mode: 'AUTO',
-  mirrored: true,
-  trailEnabled: false,
-  airDrawEnabled: false,
-  drawColor: 'CYAN',
-  hdDenoise: true,
-  cyberHud: true,
-  noteOpen: false,
-  flashEnabled: false,
-};
+function purgeLegacyStorage(): void {
+  try {
+    for (let i = 0; i < LEGACY_STORAGE_KEYS.length; i += 1) {
+      window.localStorage.removeItem(LEGACY_STORAGE_KEYS[i]);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function loadSavedCameraPreset(): CameraPresetId {
+  try {
+    const v = window.localStorage.getItem(CAMERA_PRESET_STORAGE_KEY);
+    if (v === 'AUTO' || v === '720P' || v === '1080P') return v;
+    if (v === '720P_30' || v === '720P_60') return '720P';
+    if (v === '1080P_30' || v === '1080P_60') return '1080P';
+  } catch {
+    // ignore storage errors
+  }
+  return 'AUTO';
+}
+
+function saveCameraPreset(preset: CameraPresetId): void {
+  try {
+    window.localStorage.setItem(CAMERA_PRESET_STORAGE_KEY, preset);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function loadSavedSfxEnabled(): boolean {
+  try {
+    const v = window.localStorage.getItem(SFX_STORAGE_KEY);
+    if (v === '0') return false;
+  } catch {
+    // ignore storage errors
+  }
+  return true;
+}
+
+function saveSfxEnabled(enabled: boolean): void {
+  try {
+    window.localStorage.setItem(SFX_STORAGE_KEY, enabled ? '1' : '0');
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function createInitialSettings(): PrismSettings {
+  return {
+    mode: 'AUTO',
+    mirrored: true,
+    trailEnabled: false,
+    airDrawEnabled: false,
+    drawColor: 'CYAN',
+    hdDenoise: true,
+    cyberHud: true,
+    noteOpen: false,
+    sfxEnabled: loadSavedSfxEnabled(),
+  };
+}
 
 type VideoWithRvfc = HTMLVideoElement & {
   requestVideoFrameCallback?: (cb: (now: number) => void) => number;
@@ -75,20 +168,101 @@ type VideoWithRvfc = HTMLVideoElement & {
 
 interface ExtendedTrackCapabilities extends MediaTrackCapabilities {
   focusMode?: string[];
-  exposureMode?: string[];
 }
 
 interface ExtendedTrackSettings extends MediaTrackSettings {
   focusDistance?: number;
 }
 
+function getVideoConstraintsForPreset(preset: CameraPresetId): MediaTrackConstraints {
+  switch (preset) {
+    case '720P':
+      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+    case '1080P':
+      return { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+    case 'AUTO':
+    default:
+      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+  }
+}
+
+/** Safely opens webcam (or OBS Virtual Camera) with flexible user-selected resolution. */
+async function openCameraStream(
+  preferredDeviceId?: string,
+  preset: CameraPresetId = 'AUTO',
+): Promise<MediaStream> {
+  const baseVideo = getVideoConstraintsForPreset(preset);
+
+  if (preferredDeviceId) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        video: { ...baseVideo, deviceId: { exact: preferredDeviceId } },
+        audio: false,
+      });
+    } catch {
+      // Saved camera disconnected or rejected preset; fall through to default camera
+    }
+  }
+
+  return navigator.mediaDevices.getUserMedia({
+    video: { ...baseVideo, facingMode: 'user' },
+    audio: false,
+  });
+}
+
+/** Safely locks Auto-Focus after 1.5s settle (no-op on virtual cameras with zero errors). */
+function scheduleSafeFocusLock(
+  stream: MediaStream,
+  isCancelled: () => boolean,
+): number | null {
+  try {
+    const videoTrack = stream.getVideoTracks()[0];
+    if (!videoTrack || typeof videoTrack.getCapabilities !== 'function') return null;
+
+    return window.setTimeout(() => {
+      if (isCancelled() || videoTrack.readyState !== 'live') return;
+      try {
+        const caps = videoTrack.getCapabilities() as ExtendedTrackCapabilities;
+        const focusModes = caps?.focusMode;
+        if (!Array.isArray(focusModes) || focusModes.length === 0) return;
+
+        const advanced: Record<string, unknown>[] = [];
+        if (focusModes.includes('single-shot')) {
+          advanced.push({ focusMode: 'single-shot' });
+        } else if (focusModes.includes('manual')) {
+          const curSettings =
+            typeof videoTrack.getSettings === 'function'
+              ? (videoTrack.getSettings() as ExtendedTrackSettings)
+              : {};
+          if (typeof curSettings.focusDistance === 'number') {
+            advanced.push({ focusMode: 'manual', focusDistance: curSettings.focusDistance });
+          } else {
+            advanced.push({ focusMode: 'manual' });
+          }
+        }
+        if (advanced.length > 0) {
+          void videoTrack
+            .applyConstraints({ advanced: advanced as MediaTrackConstraintSet[] })
+            .catch(() => {});
+        }
+      } catch {
+        // Driver without UVC focus lock — ignore safely
+      }
+    }, 1500);
+  } catch {
+    return null;
+  }
+}
+
 export default function App() {
   const [engineStatus, setEngineStatus] = useState<EngineStatus>('loading');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [gpuInfo, setGpuInfo] = useState<GpuInfo | null>(null);
-  const [modeToast, setModeToast] = useState<string | null>(null);
+  const [modeToast, setModeToast] = useState<{ text: string; key: number } | null>(null);
   const [toolsOpen, setToolsOpen] = useState<boolean>(false);
-  const [settings, setSettings] = useState<PrismSettings>(INITIAL_SETTINGS);
+  const [settings, setSettings] = useState<PrismSettings>(createInitialSettings);
+  const [cameras, setCameras] = useState<CameraDeviceItem[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string>('');
+  const [cameraPreset, setCameraPreset] = useState<CameraPresetId>(loadSavedCameraPreset);
   const [retryToken, setRetryToken] = useState(0);
 
   // Centered 3D Extruded Hologram Text state
@@ -98,27 +272,35 @@ export default function App() {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const glCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cosmosCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const glowCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const fpsTextRef = useRef<HTMLSpanElement | null>(null);
   const aiFpsTextRef = useRef<HTMLSpanElement | null>(null);
   const modeTextRef = useRef<HTMLSpanElement | null>(null);
-  const lightingBadgeRef = useRef<HTMLSpanElement | null>(null);
-  const lightingTextRef = useRef<HTMLSpanElement | null>(null);
+  const lowLightDotRef = useRef<HTMLSpanElement | null>(null);
   const uiRootRef = useRef<HTMLDivElement | null>(null);
   const dockNavRef = useRef<HTMLElement | null>(null);
-  const flashOverlayRef = useRef<HTMLDivElement | null>(null);
   const airCursorRef = useRef<AirCursorHandle | null>(null);
   const holoTextRef = useRef<HoloText3DHandle | null>(null);
 
   const settingsRef = useRef<PrismSettings>(settings);
   const toolsOpenRef = useRef<boolean>(toolsOpen);
   const engineRef = useRef<OpticalPrismEngine | null>(null);
+  const trackerClientRef = useRef<HandTrackerClient | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const focusTimerRef = useRef<number | null>(null);
   const stabilizersRef = useRef([new GestureStabilizer(1), new GestureStabilizer(1)]);
-  const snapDetectorRef = useRef(new FingerSnapDetector());
-  const swipeDetectorRef = useRef(new AirSwipeDetector());
+  const gestureManagerRef = useRef(new GestureManager());
+  const swipeIndicatorRef = useRef<SwipeIndicatorState>({
+    active: false,
+    dir: 0,
+    progress: 0,
+    normX: 0.5,
+    normY: 0.5,
+  });
+  const hoveringUiRef = useRef<boolean>(false);
+  const hoveredUiItemRef = useRef<string | null>(null);
   const blinkDetectorRef = useRef(new HandBlinkDetector());
-
-  // Cached Magnetic DOMRects (+14px padding) synced automatically by ResizeObserver & MutationObserver
   const cachedButtonsRef = useRef<CachedButtonRect[]>([]);
 
   const lastActiveModeRef = useRef<CycleModeId>('GLASS');
@@ -126,9 +308,25 @@ export default function App() {
   const dockAwakeRef = useRef<boolean>(true);
   const dockNearCursorRef = useRef<boolean>(false);
   const toastTimerRef = useRef<number | null>(null);
-  const whiteFlashTimeRef = useRef<number>(-1);
+  const toastSeqRef = useRef<number>(0);
   const holoCursorIdxRef = useRef<number>(0);
   const holoStepToggleRef = useRef<boolean>(false);
+  const mockPoseRef = useRef<MockPoseId>('QUAD_TWO_HANDS');
+  const mockPoseStartRef = useRef<number>(performance.now());
+  const engineStatusRef = useRef<EngineStatus>('loading');
+  const holoTextValueRef = useRef<string>('');
+
+  useEffect(() => {
+    purgeLegacyStorage();
+  }, []);
+
+  useEffect(() => {
+    engineStatusRef.current = engineStatus;
+  }, [engineStatus]);
+
+  useEffect(() => {
+    holoTextValueRef.current = holoText;
+  }, [holoText]);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -137,6 +335,87 @@ export default function App() {
   useEffect(() => {
     toolsOpenRef.current = toolsOpen;
   }, [toolsOpen]);
+
+  /** Enumerates available videoinput devices for manual selection in Side Inspector. */
+  const refreshCameraList = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices
+        .filter((d) => d.kind === 'videoinput')
+        .map((d, idx) => ({
+          deviceId: d.deviceId,
+          label: d.label?.trim() || `Camera ${idx + 1}`,
+        }));
+      setCameras(videoDevices);
+    } catch {
+      // ignore enumeration errors
+    }
+  }, []);
+
+  useEffect(() => {
+    const md = navigator.mediaDevices;
+    if (!md?.addEventListener) return;
+    const onChange = () => void refreshCameraList();
+    md.addEventListener('devicechange', onChange);
+    return () => md.removeEventListener('devicechange', onChange);
+  }, [refreshCameraList]);
+
+  /** Hot-swaps camera source and/or resolution cleanly without stalling WebGL2/Three.js/Worker. */
+  const applyCameraConfig = useCallback(
+    async (deviceId: string, preset: CameraPresetId) => {
+      const video = videoRef.current;
+      if (!video) return;
+
+      try {
+        if (focusTimerRef.current !== null) {
+          window.clearTimeout(focusTimerRef.current);
+          focusTimerRef.current = null;
+        }
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+          mediaStreamRef.current = null;
+        }
+
+        const newStream = await openCameraStream(deviceId || undefined, preset);
+        mediaStreamRef.current = newStream;
+        video.srcObject = newStream;
+        await video.play();
+
+        engineRef.current?.resetSmoothing();
+        engineRef.current?.uploadVideoFrame(video);
+
+        const activeTrackId = newStream.getVideoTracks()[0]?.getSettings?.().deviceId;
+        if (activeTrackId) {
+          setSelectedCameraId(activeTrackId);
+        }
+
+        focusTimerRef.current = scheduleSafeFocusLock(newStream, () => false);
+        void refreshCameraList();
+      } catch (err) {
+        console.warn('Unable to switch camera configuration:', err);
+      }
+    },
+    [refreshCameraList],
+  );
+
+  const handleSelectCamera = useCallback(
+    (deviceId: string) => {
+      if (!deviceId) return;
+      setSelectedCameraId(deviceId);
+      void applyCameraConfig(deviceId, cameraPreset);
+    },
+    [applyCameraConfig, cameraPreset],
+  );
+
+  const handleSelectCameraPreset = useCallback(
+    (preset: CameraPresetId) => {
+      saveCameraPreset(preset);
+      setCameraPreset(preset);
+      void applyCameraConfig(selectedCameraId, preset);
+    },
+    [applyCameraConfig, selectedCameraId],
+  );
 
   /** Recomputes cached +14px magnetic button DOMRects (zero layout thrashing inside rAF). */
   const refreshCachedUiRects = useCallback(() => {
@@ -161,7 +440,6 @@ export default function App() {
     cachedButtonsRef.current = next;
   }, []);
 
-  // Attach ResizeObserver & MutationObserver to UI container so button rects stay 100% synced
   useEffect(() => {
     const root = uiRootRef.current;
     if (!root) return;
@@ -187,9 +465,9 @@ export default function App() {
   const applyDockStyle = useCallback((awake: boolean, boosted: boolean) => {
     const nav = dockNavRef.current;
     if (!nav) return;
-    nav.style.opacity = awake ? '1' : '0.25';
+    nav.style.opacity = awake ? '1' : '0.32';
     nav.style.transform = boosted
-      ? 'translateX(-50%) scale(1.03)'
+      ? 'translateX(-50%) scale(1.02)'
       : 'translateX(-50%) scale(1)';
   }, []);
 
@@ -206,7 +484,8 @@ export default function App() {
   );
 
   const showModeToast = useCallback((mode: CycleModeId) => {
-    setModeToast(MODE_DISPLAY_NAME[mode]);
+    toastSeqRef.current += 1;
+    setModeToast({ text: MODE_DISPLAY_NAME[mode], key: toastSeqRef.current });
     if (toastTimerRef.current !== null) {
       window.clearTimeout(toastTimerRef.current);
     }
@@ -222,6 +501,9 @@ export default function App() {
       setSettings((prev) => {
         if (patch.mirrored !== undefined && patch.mirrored !== prev.mirrored) {
           engineRef.current?.resetSmoothing();
+        }
+        if (patch.sfxEnabled !== undefined && patch.sfxEnabled !== prev.sfxEnabled) {
+          saveSfxEnabled(patch.sfxEnabled);
         }
         if (patch.mode && patch.mode !== 'AUTO' && patch.mode !== prev.mode) {
           showModeToast(patch.mode);
@@ -252,13 +534,6 @@ export default function App() {
     },
     [showModeToast],
   );
-
-  const handleTriggerWhiteFlash = useCallback(() => {
-    whiteFlashTimeRef.current = 0;
-    if (flashOverlayRef.current) {
-      flashOverlayRef.current.style.opacity = '1';
-    }
-  }, []);
 
   const handleClearDrawing = useCallback(() => {
     markDockActivity(true);
@@ -298,7 +573,6 @@ export default function App() {
     return () => window.removeEventListener('pointermove', onPointerMove);
   }, [markDockActivity]);
 
-  /** Lock both WebGL2 and Canvas 2D strictly to dpr = 1 for steady 144Hz fill-rate. */
   const syncCanvases = useCallback(() => {
     const w = Math.max(1, window.innerWidth);
     const h = Math.max(1, window.innerHeight);
@@ -328,17 +602,24 @@ export default function App() {
     let cancelled = false;
     let rafId = 0;
     let rvfcId = 0;
-    let focusLockTimerId: number | null = null;
-    let mediaStream: MediaStream | null = null;
+    let mockIntervalId = 0;
+    let stopMockStream: (() => void) | null = null;
     let prismEngine: OpticalPrismEngine | null = null;
     let trackerClient: HandTrackerClient | null = null;
     let hoveredBtn: HTMLButtonElement | null = null;
 
+    const searchParams = new URLSearchParams(window.location.search);
+    const isTestMode = searchParams.get('test') === '1';
+    const initialTestPose = (searchParams.get('pose') as MockPoseId | null) ?? 'QUAD_TWO_HANDS';
+    if (isTestMode) {
+      mockPoseRef.current = initialTestPose;
+      mockPoseStartRef.current = performance.now();
+    }
+
     setEngineStatus('loading');
     setErrorMessage(null);
     stabilizersRef.current.forEach((s) => s.reset());
-    snapDetectorRef.current.reset();
-    swipeDetectorRef.current.reset();
+    gestureManagerRef.current.reset();
     blinkDetectorRef.current.reset();
 
     const clearHoverAttr = () => {
@@ -346,39 +627,30 @@ export default function App() {
         hoveredBtn.removeAttribute('data-air-hover');
         hoveredBtn = null;
       }
+      hoveredUiItemRef.current = null;
     };
 
     const updateLightingDom = (status: LightingStatus) => {
-      const badge = lightingBadgeRef.current;
-      const text = lightingTextRef.current;
-      if (!badge || !text) return;
-      if (status === 'LOW_LIGHT_BOOST') {
-        badge.style.color = '#fde047';
-        text.textContent = 'LOW-LIGHT BOOST ON';
-      } else if (status === 'HIGHLIGHT_TAME') {
-        badge.style.color = '#fb923c';
-        text.textContent = 'HIGHLIGHT TAME';
-      } else {
-        badge.style.color = '#4ade80';
-        text.textContent = 'LIGHT OK';
-      }
+      const dot = lowLightDotRef.current;
+      if (!dot) return;
+      dot.style.display = status === 'LOW_LIGHT_BOOST' ? 'inline-block' : 'none';
     };
 
     async function boot() {
       try {
         if (!navigator.mediaDevices?.getUserMedia) {
-          throw new Error('Trình duyệt không hỗ trợ mở webcam (getUserMedia).');
+          throw new Error('Camera access (getUserMedia) is not supported in this browser.');
         }
         const glCanvas = glCanvasRef.current;
-        if (!glCanvas) throw new Error('Không tìm thấy khung dựng WebGL2.');
+        if (!glCanvas) throw new Error('WebGL2 viewport failed to mount.');
 
-        // Shared latest AI state updated asynchronously by the Web Worker (zero main-thread stall!)
         let latestHands: Landmark3D[][] = [];
         let latestGestures: GestureType[] = ['IDLE', 'IDLE'];
         let lastLighting: LightingStatus | null = null;
         let lastAiFpsUpdateMs = 0;
 
         trackerClient = new HandTrackerClient();
+        trackerClientRef.current = trackerClient;
 
         const onWorkerResult = (packet: {
           landmarks: Landmark3D[][];
@@ -411,28 +683,22 @@ export default function App() {
 
           const curSettings = settingsRef.current;
 
-          // Standalone Full-Screen White Flash on Finger Snap ONLY when Flash button is ON
-          if (curSettings.flashEnabled) {
-            const snaps = snapDetectorRef.current.update(latestHands, now);
-            if (snaps.length > 0) {
-              handleTriggerWhiteFlash();
-            }
+          // Centralized Priority GestureManager FSM: UI_CURSOR > AIR_DRAW > MODE_GESTURE > AIR_SWIPE
+          const gestureDecision = gestureManagerRef.current.update({
+            hands: latestHands,
+            gestures: latestGestures,
+            nowMs: now,
+            settings: curSettings,
+            activeMode: lastActiveModeRef.current,
+            isHoveringUi: hoveringUiRef.current,
+            cosmosBlackHoleBusy: engineRef.current?.isCosmosBlackHoleBusy() ?? false,
+          });
+          swipeIndicatorRef.current = gestureDecision.swipeIndicator;
+          if (gestureDecision.swipeDir !== 0) {
+            handleStepMode(gestureDecision.swipeDir);
           }
 
-          // Air Swipe 2.0 (280ms sliding window, non-fist hand, not in Air Draw)
-          if (!curSettings.airDrawEnabled) {
-            const swipeDir = swipeDetectorRef.current.update(
-              latestHands,
-              latestGestures,
-              now,
-              curSettings.mirrored,
-            );
-            if (swipeDir !== 0) {
-              handleStepMode(swipeDir);
-            }
-          }
-
-          // Centered 3D Hologram Text rapid hand-blink typing ("xin chào tôi là hưng")
+          // Centered 3D Hologram Text rapid hand-blink typing
           if (curSettings.noteOpen && latestHands.length > 0) {
             const blinkEvents = blinkDetectorRef.current.update(latestHands, latestGestures, now);
             if (blinkEvents.length > 0) {
@@ -458,30 +724,95 @@ export default function App() {
           }
         };
 
-        const [stream, detectedGpu] = await Promise.all([
-          navigator.mediaDevices.getUserMedia({
-            video: {
-              facingMode: 'user',
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-              frameRate: { ideal: 30, max: 30 },
+        const savedPreset = loadSavedCameraPreset();
+        let stream: MediaStream;
+
+        let perfSamples = 0;
+        let perfFpsSum = 0;
+        let perfRenderSumMs = 0;
+        let perfMaxRenderMs = 0;
+
+        if (isTestMode) {
+          const mock = createMockCameraStream();
+          stream = mock.stream;
+          stopMockStream = mock.stop;
+          window.__VISION_TEST__ = {
+            setPose: (pose: MockPoseId) => {
+              mockPoseRef.current = pose;
+              mockPoseStartRef.current = performance.now();
             },
-            audio: false,
-          }),
-          trackerClient.init(onWorkerResult),
-        ]);
+            setMode: (mode: PrismSettings['mode']) => {
+              setSettings((prev) => ({
+                ...prev,
+                mode,
+                airDrawEnabled: false,
+              }));
+            },
+            setNoteOpen: (open: boolean) => {
+              setSettings((prev) => ({ ...prev, noteOpen: open }));
+            },
+            setToolsOpen: (open: boolean) => {
+              setToolsOpen(open);
+            },
+            setAirDraw: (airDrawEnabled: boolean) => {
+              setSettings((prev) => ({ ...prev, airDrawEnabled }));
+            },
+            prewarmCosmos: () => {
+              engineRef.current?.prewarmCosmosNow();
+            },
+            resetPerf: () => {
+              perfSamples = 0;
+              perfFpsSum = 0;
+              perfRenderSumMs = 0;
+              perfMaxRenderMs = 0;
+            },
+            getPerf: () => ({
+              avgFps: perfSamples > 0 ? Math.round((perfFpsSum / perfSamples) * 10) / 10 : 0,
+              maxRenderMs: Math.round(perfMaxRenderMs * 100) / 100,
+              avgRenderMs:
+                perfSamples > 0 ? Math.round((perfRenderSumMs / perfSamples) * 100) / 100 : 0,
+              samples: perfSamples,
+            }),
+            getHoveredUiItem: () => hoveredUiItemRef.current,
+            getState: () => ({
+              mode: settingsRef.current.mode,
+              activeMode: lastActiveModeRef.current,
+              pose: mockPoseRef.current,
+              noteOpen: settingsRef.current.noteOpen,
+              toolsOpen: toolsOpenRef.current,
+              airDrawEnabled: settingsRef.current.airDrawEnabled,
+              holoText: holoTextValueRef.current,
+              engineStatus: engineStatusRef.current,
+            }),
+          };
+        } else {
+          // Always boot with the standard system default camera
+          const [camStream] = await Promise.all([
+            openCameraStream(undefined, savedPreset),
+            trackerClient.init(onWorkerResult),
+          ]);
+          stream = camStream;
+        }
 
         if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
+          if (stopMockStream) stopMockStream();
+          else stream.getTracks().forEach((t) => t.stop());
           trackerClient.dispose();
           return;
         }
 
         syncCanvases();
-        prismEngine = new OpticalPrismEngine(glCanvas);
+        prismEngine = new OpticalPrismEngine(glCanvas, cosmosCanvasRef.current);
         engineRef.current = prismEngine;
-        mediaStream = stream;
-        setGpuInfo(detectedGpu);
+        mediaStreamRef.current = stream;
+
+        if (!isTestMode) {
+          const activeDeviceId = stream.getVideoTracks()[0]?.getSettings?.().deviceId;
+          if (activeDeviceId) {
+            setSelectedCameraId(activeDeviceId);
+          }
+          void refreshCameraList();
+        }
 
         const video = videoRef.current as VideoWithRvfc | null;
         if (!video) return;
@@ -489,55 +820,32 @@ export default function App() {
         await video.play();
         if (cancelled) return;
 
-        // Lock Auto-Focus after 1.5s initial settle to stop continuous focus hunting in low light
-        const videoTrack = stream.getVideoTracks()[0];
-        if (videoTrack && typeof videoTrack.getCapabilities === 'function') {
-          focusLockTimerId = window.setTimeout(() => {
-            if (cancelled || videoTrack.readyState !== 'live') return;
-            try {
-              const caps = videoTrack.getCapabilities() as ExtendedTrackCapabilities;
-              const focusModes = caps.focusMode;
-              if (Array.isArray(focusModes) && focusModes.length > 0) {
-                const advanced: Record<string, unknown>[] = [];
-                if (focusModes.includes('single-shot')) {
-                  advanced.push({ focusMode: 'single-shot' });
-                } else if (focusModes.includes('manual')) {
-                  const curSettings =
-                    typeof videoTrack.getSettings === 'function'
-                      ? (videoTrack.getSettings() as ExtendedTrackSettings)
-                      : {};
-                  if (typeof curSettings.focusDistance === 'number') {
-                    advanced.push({
-                      focusMode: 'manual',
-                      focusDistance: curSettings.focusDistance,
-                    });
-                  } else {
-                    advanced.push({ focusMode: 'manual' });
-                  }
-                }
-                if (advanced.length > 0) {
-                  void videoTrack.applyConstraints({
-                    advanced: advanced as MediaTrackConstraintSet[],
-                  }).catch(() => {});
-                }
-              }
-            } catch {
-              // Camera driver does not expose UVC focus lock
-            }
-          }, 1500);
+        if (!isTestMode) {
+          focusTimerRef.current = scheduleSafeFocusLock(stream, () => cancelled);
         }
-
-        // Upload initial frame immediately so WebGL2 never starts blank
         prismEngine.uploadVideoFrame(video);
 
         syncCanvases();
         setEngineStatus('ready');
 
+        if (isTestMode) {
+          mockIntervalId = window.setInterval(() => {
+            if (cancelled) return;
+            const elapsedSec = (performance.now() - mockPoseStartRef.current) / 1000;
+            const mockLm = generateMockHands(mockPoseRef.current, elapsedSec);
+            onWorkerResult({
+              landmarks: mockLm,
+              lighting: 'NORMAL',
+              avgLuma: 128,
+              aiFps: 30,
+            });
+          }, 33);
+        }
+
         const activeEngine = prismEngine;
         const activeTracker = trackerClient;
         const overlayCtx = glowCanvasRef.current?.getContext('2d', { desynchronized: true }) ?? null;
 
-        // Decoupled Camera Feed: requestVideoFrameCallback uploads texture & feeds Worker ONLY on fresh frames
         let usesRvfc = false;
         let lastFallbackVideoTime = -1;
 
@@ -546,32 +854,52 @@ export default function App() {
           const onVideoFrame = (now: number) => {
             if (cancelled) return;
             activeEngine.uploadVideoFrame(video);
-            activeTracker.submitFrame(video, now);
+            if (!isTestMode) {
+              activeTracker.submitFrame(video, now);
+            }
             rvfcId = video.requestVideoFrameCallback!(onVideoFrame);
           };
           rvfcId = video.requestVideoFrameCallback(onVideoFrame);
         }
 
         let lastFrameTime = performance.now();
-        let emaDt = 1 / 144;
+        let emaDt = 1 / 60;
         let lastFpsDisplayMs = lastFrameTime;
+        let nextRenderTime = lastFrameTime;
 
-        // VisionOS Magnetic Air-Cursor dwell-to-click state (0.65s dwell, 800ms cooldown)
         let dwellMs = 0;
         let dwellCooldownUntil = 0;
         let clickPulse = 0;
         let lastIsHoveringUi = false;
         let lastDisplayedStatus = '';
 
-        // 3D Hologram Text smooth parallax & 1.5s Fist-to-Clear timer
         let curTiltX = 0;
         let curTiltY = 0;
         let fistHoldSec = 0;
 
-        // Main Thread 120–144Hz Pure Render Loop (Zero AI Blocking, Zero setState, Zero Layout Thrashing)
+        // Drift-Free Locked 60 FPS Pro Cinema Render Loop
         const renderLoop = (now: number) => {
           if (cancelled) return;
           rafId = requestAnimationFrame(renderLoop);
+
+          const curSettings = settingsRef.current;
+
+          if (!usesRvfc && video.readyState >= 2 && video.currentTime !== lastFallbackVideoTime) {
+            lastFallbackVideoTime = video.currentTime;
+            activeEngine.uploadVideoFrame(video);
+            if (!isTestMode) {
+              activeTracker.submitFrame(video, now);
+            }
+          }
+
+          // Steady 60 FPS hardware pacing across all modes
+          if (now < nextRenderTime - 0.25) {
+            return;
+          }
+          nextRenderTime += LOCKED_FPS_INTERVAL_MS;
+          if (now - nextRenderTime > 34) {
+            nextRenderTime = now + LOCKED_FPS_INTERVAL_MS;
+          }
 
           const dtSeconds = Math.min(Math.max((now - lastFrameTime) / 1000, 0.001), 0.1);
           lastFrameTime = now;
@@ -580,45 +908,21 @@ export default function App() {
           if (now - lastFpsDisplayMs >= FPS_UPDATE_INTERVAL_MS) {
             if (fpsTextRef.current) {
               fpsTextRef.current.textContent = String(
-                Math.round(1 / Math.max(emaDt, 0.001)),
+                Math.min(60, Math.round(1 / Math.max(emaDt, 0.001))),
               ).padStart(2, '0');
             }
             lastFpsDisplayMs = now;
           }
 
-          // Fallback video submission if browser lacks requestVideoFrameCallback
-          if (!usesRvfc && video.readyState >= 2 && video.currentTime !== lastFallbackVideoTime) {
-            lastFallbackVideoTime = video.currentTime;
-            activeEngine.uploadVideoFrame(video);
-            activeTracker.submitFrame(video, now);
-          }
-
-          // Update Full-Screen White Flash (40ms peak #FFFFFF -> 380ms exponential decay)
-          if (whiteFlashTimeRef.current >= 0) {
-            whiteFlashTimeRef.current += dtSeconds;
-            const ft = whiteFlashTimeRef.current;
-            const el = flashOverlayRef.current;
-            if (ft >= FLASH_TOTAL_SEC) {
-              whiteFlashTimeRef.current = -1;
-              if (el) el.style.opacity = '0';
-            } else if (ft < FLASH_HOLD_SEC) {
-              if (el) el.style.opacity = '1';
-            } else {
-              const decayT = (ft - FLASH_HOLD_SEC) / FLASH_DECAY_SEC;
-              const op = Math.exp(-5.5 * decayT) * (1 - decayT);
-              if (el) el.style.opacity = op.toFixed(4);
-            }
-          }
-
           const glCanvasEl = glCanvasRef.current;
           if (!glCanvasEl) return;
 
-          const curSettings = settingsRef.current;
           const viewW = glCanvasEl.width;
           const viewH = glCanvasEl.height;
           const vidW = video.videoWidth || 1280;
           const vidH = video.videoHeight || 720;
 
+          const renderStartMs = performance.now();
           const frameOut = activeEngine.renderFrame(
             dtSeconds,
             viewW,
@@ -630,7 +934,15 @@ export default function App() {
             curSettings,
             lastIsHoveringUi,
             overlayCtx,
+            swipeIndicatorRef.current,
           );
+          const renderCostMs = performance.now() - renderStartMs;
+          if (isTestMode) {
+            perfSamples += 1;
+            perfFpsSum += 1 / Math.max(dtSeconds, 0.001);
+            perfRenderSumMs += renderCostMs;
+            if (renderCostMs > perfMaxRenderMs) perfMaxRenderMs = renderCostMs;
+          }
 
           lastActiveModeRef.current = frameOut.activeMode;
           const statusLabel = curSettings.airDrawEnabled ? 'AIR DRAW' : frameOut.activeMode;
@@ -665,16 +977,14 @@ export default function App() {
             fistHoldSec = 0;
           }
 
-          // VisionOS Magnetic Air-Cursor (+14px hitbox, 38% magnetic pull, 0.65s dwell, 800ms cooldown)
+          // VisionOS Magnetic Air-Cursor (+14px hitbox, 38% pull, 0.65s dwell, 800ms cooldown)
           if (clickPulse > 0) {
             clickPulse = Math.max(0, clickPulse - dtSeconds * 3.8);
           }
 
           const tip = frameOut.indexTipPx;
           if (tip) {
-            // Auto-Wake Dock whenever index finger enters bottom 25% of viewport
-            const nearBottomZone = tip.y >= viewH * 0.75;
-            if (nearBottomZone) {
+            if (tip.y >= viewH * 0.75) {
               markDockActivity(true);
             }
 
@@ -690,18 +1000,20 @@ export default function App() {
 
             const btn = hitRect ? hitRect.btn : null;
             lastIsHoveringUi = Boolean(btn);
+            hoveringUiRef.current = lastIsHoveringUi;
 
             if (btn !== hoveredBtn) {
               clearHoverAttr();
               if (btn) {
                 btn.setAttribute('data-air-hover', 'true');
                 hoveredBtn = btn;
+                hoveredUiItemRef.current =
+                  btn.getAttribute('data-dock-item') ?? btn.getAttribute('aria-label') ?? btn.textContent;
                 markDockActivity(true);
               }
               dwellMs = 0;
             }
 
-            // Apply gentle magnetic damping toward button center while inside +14px hitbox
             const displayPos = hitRect
               ? {
                   x: tip.x + (hitRect.cx - tip.x) * MAGNETIC_PULL,
@@ -727,12 +1039,12 @@ export default function App() {
             airCursorRef.current?.update(displayPos, progress, Boolean(hoveredBtn), clickPulse);
           } else {
             lastIsHoveringUi = false;
+            hoveringUiRef.current = false;
             clearHoverAttr();
             dwellMs = 0;
             airCursorRef.current?.update(null, 0, false, 0);
           }
 
-          // Imperative VisionOS Auto-Fade after 2.5s inactivity
           const shouldBeAwake =
             toolsOpenRef.current || now - lastDockActivityRef.current <= DOCK_AUTO_FADE_MS;
           if (shouldBeAwake !== dockAwakeRef.current) {
@@ -746,7 +1058,7 @@ export default function App() {
       } catch (err) {
         if (cancelled) return;
         setErrorMessage(
-          err instanceof Error ? err.message : 'Không thể mở webcam hoặc khởi tạo WebGL2.',
+          err instanceof Error ? err.message : 'Unable to start camera or WebGL2 renderer.',
         );
         setEngineStatus('error');
       }
@@ -757,22 +1069,36 @@ export default function App() {
     return () => {
       cancelled = true;
       clearHoverAttr();
-      if (focusLockTimerId !== null) {
-        window.clearTimeout(focusLockTimerId);
-        focusLockTimerId = null;
+      if (focusTimerRef.current !== null) {
+        window.clearTimeout(focusTimerRef.current);
+        focusTimerRef.current = null;
       }
       if (toastTimerRef.current !== null) {
         window.clearTimeout(toastTimerRef.current);
         toastTimerRef.current = null;
       }
       if (rafId) cancelAnimationFrame(rafId);
+      if (mockIntervalId) window.clearInterval(mockIntervalId);
+      if (stopMockStream) {
+        stopMockStream();
+        stopMockStream = null;
+      }
+      if (isTestMode) {
+        delete window.__VISION_TEST__;
+      }
       const vid = videoRef.current as VideoWithRvfc | null;
       if (rvfcId && vid?.cancelVideoFrameCallback) {
         vid.cancelVideoFrameCallback(rvfcId);
       }
-      if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+        mediaStreamRef.current = null;
+      }
       if (trackerClient) {
         trackerClient.dispose();
+        if (trackerClientRef.current === trackerClient) {
+          trackerClientRef.current = null;
+        }
         trackerClient = null;
       }
       if (prismEngine) {
@@ -787,15 +1113,15 @@ export default function App() {
     applyDockStyle,
     handleClearNote,
     handleStepMode,
-    handleTriggerWhiteFlash,
     markDockActivity,
+    refreshCameraList,
     retryToken,
     syncCanvases,
   ]);
 
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-black">
-      {/* Raw video hidden cleanly (opacity-0 pointer-events-none) so WebGL2 never overlaps with raw video */}
+      {/* Hidden raw video source (rendered through WebGL2 Cinema Clean FBO) */}
       <video
         ref={videoRef}
         playsInline
@@ -806,19 +1132,24 @@ export default function App() {
         }`}
       />
 
-      {/* Layer 1 (Zero-Copy, dpr=1): WebGL2 GPU HD+ Denoise / CAS + Optical Polygons */}
+      {/* Layer 1: WebGL2 2-Pass Cinema Clean FBO + Optical Polygons */}
       <canvas
         ref={glCanvasRef}
         className="pointer-events-none fixed inset-0 z-10 h-full w-full"
       />
 
-      {/* Layer 2 (Zero-Copy, dpr=1): Transparent Canvas 2D for src/fx/ + Cyber HUD + Air Draw */}
+      {/* Layer 2: Three.js WebGL2 + UnrealBloomPass (Cosmos & 3D Volumetric Lightning) */}
+      <canvas
+        ref={cosmosCanvasRef}
+        className="pointer-events-none fixed inset-0 z-10 h-full w-full"
+      />
+
+      {/* Layer 3: Transparent Canvas 2D (Mystic, Cyber HUD, Air Draw, Trails & Planet Tags) */}
       <canvas
         ref={glowCanvasRef}
         className="pointer-events-none fixed inset-0 z-10 h-full w-full"
       />
 
-      {/* Centered 3D Extruded Hologram Text ("xin chào tôi là hưng") — zero box/card */}
       {settings.noteOpen && (
         <HoloText3D
           ref={holoTextRef}
@@ -828,30 +1159,25 @@ export default function App() {
         />
       )}
 
-      {/* Standalone Full-Screen White Flash Layer (40ms peak #FFFFFF -> 380ms exponential decay) */}
-      <div
-        ref={flashOverlayRef}
-        aria-hidden="true"
-        className="pointer-events-none fixed inset-0 z-30 bg-white opacity-0 will-change-[opacity]"
-      />
-
       <PrismBar
         settings={settings}
         onSettingsChange={handleSettingsChange}
         modeToast={modeToast}
-        gpuInfo={gpuInfo}
+        cameras={cameras}
+        selectedCameraId={selectedCameraId}
+        cameraPreset={cameraPreset}
+        onSelectCamera={handleSelectCamera}
+        onSelectCameraPreset={handleSelectCameraPreset}
         fpsTextRef={fpsTextRef}
         aiFpsTextRef={aiFpsTextRef}
         modeTextRef={modeTextRef}
-        lightingBadgeRef={lightingBadgeRef}
-        lightingTextRef={lightingTextRef}
+        lowLightDotRef={lowLightDotRef}
         uiRootRef={uiRootRef}
         dockNavRef={dockNavRef}
         toolsOpen={toolsOpen}
         onToggleTools={handleToggleTools}
         onDockActivity={() => markDockActivity(true)}
         onStepMode={handleStepMode}
-        onTriggerWhiteFlash={handleTriggerWhiteFlash}
         onClearDrawing={handleClearDrawing}
         onClearNote={handleClearNote}
       />
@@ -862,15 +1188,13 @@ export default function App() {
         <div
           role="status"
           aria-live="polite"
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/90 p-4"
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/88 p-4 backdrop-blur-xl"
         >
-          <div className="flex max-w-sm flex-col items-center gap-3 rounded-xl border border-white/12 bg-[#0d1017] px-7 py-6 text-center">
-            <Loader2 className="h-6 w-6 animate-spin text-[#38bdf8]" aria-hidden="true" />
-            <h1 className="text-sm font-semibold text-white">
-              Đang khởi chạy VisionArcade
-            </h1>
-            <p className="text-xs text-white/65">
-              Đang nạp MediaPipe HandLandmarker trên Web Worker và bộ lọc HD+ GPU.
+          <div className="flex max-w-sm flex-col items-center gap-3 rounded-2xl border border-white/12 bg-neutral-950/80 px-7 py-6 text-center backdrop-blur-2xl">
+            <Loader2 className="h-5 w-5 animate-spin text-white/85" aria-hidden="true" />
+            <h1 className="text-sm font-medium text-white">Starting VisionArcade</h1>
+            <p className="text-xs text-white/55">
+              Initializing hand tracking worker, WebGL2 cinema pipeline, and 3D stage.
             </p>
           </div>
         </div>
@@ -879,21 +1203,21 @@ export default function App() {
       {engineStatus === 'error' && (
         <div
           role="alert"
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/92 p-4"
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/90 p-4 backdrop-blur-xl"
         >
-          <div className="flex max-w-md flex-col items-center gap-3.5 rounded-xl border border-white/12 bg-[#0d1017] px-7 py-6 text-center">
-            <Camera className="h-6 w-6 text-[#38bdf8]" aria-hidden="true" />
-            <h1 className="text-sm font-semibold text-white">Không thể khởi chạy camera</h1>
-            <p className="text-xs text-white/65">
-              {errorMessage ?? 'Hãy cấp quyền webcam cho trình duyệt rồi thử lại.'}
+          <div className="flex max-w-md flex-col items-center gap-3.5 rounded-2xl border border-white/12 bg-neutral-950/80 px-7 py-6 text-center backdrop-blur-2xl">
+            <Camera className="h-5 w-5 text-white/80" aria-hidden="true" />
+            <h1 className="text-sm font-medium text-white">Camera Unavailable</h1>
+            <p className="text-xs text-white/55">
+              {errorMessage ?? 'Grant camera permission in your browser and try again.'}
             </p>
             <button
               type="button"
               onClick={() => setRetryToken((t) => t + 1)}
-              className="mt-1 inline-flex h-10 items-center gap-2 rounded-full bg-white px-5 text-xs font-semibold text-black transition-colors hover:bg-white/90"
+              className="mt-1 inline-flex h-9 items-center gap-2 rounded-full bg-white px-5 text-xs font-medium text-black transition-colors hover:bg-white/90"
             >
               <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Thử lại</span>
+              <span>Retry</span>
             </button>
           </div>
         </div>

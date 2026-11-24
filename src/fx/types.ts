@@ -6,12 +6,16 @@ export interface Point2D {
 }
 
 export interface HandPose2D {
+  /** Stable slot ID (0 or 1), preserved across frames via nearest-neighbor tracking. */
+  id: number;
   /** All 21 smoothed screen-space landmarks (x, y) in flat Float32Array[42]. */
   pts: Float32Array;
   palmX: number;
   palmY: number;
   palmScale: number;
   palmSpeedMps: number;
+  /** 1.0 when actively tracked, gently decaying during 180ms persistence grace period. */
+  confidence: number;
   gesture: GestureType;
 }
 

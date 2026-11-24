@@ -19,7 +19,7 @@ function modeNeonColor(mode: PrismModeId): string {
       return '#fb923c';
     case 'PRISM':
       return '#f472b6';
-    case 'GALAXY':
+    case 'COSMOS':
       return '#a855f7';
     case 'LIGHTNING':
       return '#38bdf8';

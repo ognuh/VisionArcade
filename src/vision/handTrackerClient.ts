@@ -12,8 +12,8 @@ export interface TrackingResultPacket {
   aiFps: number;
 }
 
-const AI_W = 320;
-const AI_H = 180;
+const AI_W = 480;
+const AI_H = 270;
 const LUMA_CHECK_MS = 500;
 
 /**

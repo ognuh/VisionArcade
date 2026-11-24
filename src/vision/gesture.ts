@@ -48,16 +48,6 @@ export function classifyHandGesture(
   const middleMcp = landmarks[9];
   const palmScale = Math.max(dist2D(wrist, middleMcp), 0.001);
 
-  const thumbTip = landmarks[4];
-  const indexTip = landmarks[8];
-  const pinchRatio = dist2D(thumbTip, indexTip) / palmScale;
-
-  // Schmitt-trigger hysteresis: tighter to enter PINCH, wider to release.
-  const pinchThreshold = prevGesture === 'PINCH' ? 0.44 : 0.31;
-  if (pinchRatio < pinchThreshold) {
-    return 'PINCH';
-  }
-
   const indexOpen = isFingerExtended(landmarks, 5, 6, 8);
   const middleOpen = isFingerExtended(landmarks, 9, 10, 12);
   const ringOpen = isFingerExtended(landmarks, 13, 14, 16);
@@ -69,12 +59,23 @@ export function classifyHandGesture(
     (ringOpen ? 1 : 0) +
     (pinkyOpen ? 1 : 0);
 
-  if (indexOpen && !middleOpen && !ringOpen && !pinkyOpen) {
-    return 'POINT';
-  }
-
+  // Check closed FIST first so thumb resting against curled index never misclassifies as PINCH
   if (openCount === 0) {
     return 'FIST';
+  }
+
+  const thumbTip = landmarks[4];
+  const indexTip = landmarks[8];
+  const pinchRatio = dist2D(thumbTip, indexTip) / palmScale;
+
+  // Schmitt-trigger hysteresis: tighter to enter PINCH, wider to release.
+  const pinchThreshold = prevGesture === 'PINCH' ? 0.44 : 0.31;
+  if (pinchRatio < pinchThreshold) {
+    return 'PINCH';
+  }
+
+  if (indexOpen && !middleOpen && !ringOpen && !pinkyOpen) {
+    return 'POINT';
   }
 
   if (openCount >= 3) {

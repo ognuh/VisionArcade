@@ -20,7 +20,7 @@ export type PrismModeId =
   | 'GLASS'
   | 'THERMAL'
   | 'PRISM'
-  | 'GALAXY'
+  | 'COSMOS'
   | 'LIGHTNING'
   | 'MYSTIC';
 
@@ -30,12 +30,19 @@ export const MODE_CYCLE_ORDER: readonly CycleModeId[] = [
   'GLASS',
   'THERMAL',
   'PRISM',
-  'GALAXY',
+  'COSMOS',
   'LIGHTNING',
   'MYSTIC',
 ];
 
 export type AirDrawColorId = 'CYAN' | 'MAGENTA' | 'GREEN' | 'GOLD';
+
+export type CameraPresetId = 'AUTO' | '720P' | '1080P';
+
+export interface CameraDeviceItem {
+  deviceId: string;
+  label: string;
+}
 
 export interface PrismSettings {
   mode: PrismModeId;
@@ -46,5 +53,5 @@ export interface PrismSettings {
   hdDenoise: boolean;
   cyberHud: boolean;
   noteOpen: boolean;
-  flashEnabled: boolean;
+  sfxEnabled: boolean;
 }

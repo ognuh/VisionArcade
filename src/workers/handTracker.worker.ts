@@ -7,8 +7,8 @@ const MEDIAPIPE_WASM_ROOT =
 const HAND_LANDMARKER_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
-const AI_W = 320;
-const AI_H = 180;
+const AI_W = 480;
+const AI_H = 270;
 const LUMA_SAMPLE_INTERVAL_MS = 500;
 
 export type LightingStatus = 'NORMAL' | 'LOW_LIGHT_BOOST' | 'HIGHLIGHT_TAME';
@@ -108,7 +108,7 @@ function detectWorkerGpu(): { renderer: string; tier: GpuTier } {
   }
 }
 
-/** Adaptive Auto-Exposure & Contrast Boost on 320x180 OffscreenCanvas strictly for AI input. */
+/** Adaptive Auto-Exposure & Contrast Boost on 480x270 OffscreenCanvas strictly for AI input. */
 function preprocessForAi(bitmap: ImageBitmap, nowMs: number): OffscreenCanvas {
   if (!prepCanvas || !prepCtx) {
     prepCanvas = new OffscreenCanvas(AI_W, AI_H);

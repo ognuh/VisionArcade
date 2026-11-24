@@ -1,44 +1,44 @@
-import { useEffect, type RefObject } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import {
   BookOpen,
-  Brush,
+  ChevronDown,
   CloudLightning,
   Contrast,
-  Cpu,
-  Eraser,
   Flame,
-  FlipHorizontal2,
   Layers,
   Orbit,
   Scan,
   Shield,
-  Sliders,
   SlidersHorizontal,
-  Sun,
-  Trash2,
-  Wind,
-  Zap,
 } from 'lucide-react';
 import { AIR_DRAW_COLORS } from '../prism/prismEngine';
-import type { AirDrawColorId, GpuInfo, PrismModeId, PrismSettings } from '../types/vision';
+import type {
+  AirDrawColorId,
+  CameraDeviceItem,
+  CameraPresetId,
+  PrismModeId,
+  PrismSettings,
+} from '../types/vision';
 
 interface PrismBarProps {
   settings: PrismSettings;
   onSettingsChange: (patch: Partial<PrismSettings>) => void;
-  modeToast: string | null;
-  gpuInfo: GpuInfo | null;
+  modeToast: { text: string; key: number } | null;
+  cameras: CameraDeviceItem[];
+  selectedCameraId: string;
+  cameraPreset: CameraPresetId;
+  onSelectCamera: (deviceId: string) => void;
+  onSelectCameraPreset: (preset: CameraPresetId) => void;
   fpsTextRef: RefObject<HTMLSpanElement | null>;
   aiFpsTextRef: RefObject<HTMLSpanElement | null>;
   modeTextRef: RefObject<HTMLSpanElement | null>;
-  lightingBadgeRef: RefObject<HTMLSpanElement | null>;
-  lightingTextRef: RefObject<HTMLSpanElement | null>;
+  lowLightDotRef: RefObject<HTMLSpanElement | null>;
   uiRootRef: RefObject<HTMLDivElement | null>;
   dockNavRef: RefObject<HTMLElement | null>;
   toolsOpen: boolean;
   onToggleTools: () => void;
   onDockActivity: () => void;
   onStepMode: (dir: -1 | 1) => void;
-  onTriggerWhiteFlash: () => void;
   onClearDrawing: () => void;
   onClearNote: () => void;
 }
@@ -48,41 +48,118 @@ const MODES: { id: PrismModeId; label: string; keyHint: string; icon: typeof Sca
   { id: 'GLASS', label: 'Glass', keyHint: '2', icon: Contrast },
   { id: 'THERMAL', label: 'Thermal', keyHint: '3', icon: Flame },
   { id: 'PRISM', label: 'Prism', keyHint: '4', icon: Layers },
-  { id: 'GALAXY', label: 'Galaxy', keyHint: '5', icon: Orbit },
+  { id: 'COSMOS', label: 'Cosmos', keyHint: '5', icon: Orbit },
   { id: 'LIGHTNING', label: 'Lightning', keyHint: '6', icon: CloudLightning },
   { id: 'MYSTIC', label: 'Mystic', keyHint: '7', icon: Shield },
 ];
 
+const CAMERA_PRESETS: { id: CameraPresetId; label: string }[] = [
+  { id: 'AUTO', label: 'Auto' },
+  { id: '720P', label: '720p' },
+  { id: '1080P', label: '1080p' },
+];
+
 const DRAW_COLOR_KEYS: AirDrawColorId[] = ['CYAN', 'MAGENTA', 'GREEN', 'GOLD'];
+
+interface ToggleRowProps {
+  label: string;
+  checked: boolean;
+  onToggle: () => void;
+}
+
+function StudioToggleRow({ label, checked, onToggle }: ToggleRowProps) {
+  return (
+    <div className="flex items-center justify-between py-1">
+      <span className="text-xs font-normal text-white/85">{label}</span>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        data-air-clickable="true"
+        onClick={onToggle}
+        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors duration-200 ${
+          checked ? 'bg-white' : 'bg-white/15 hover:bg-white/22'
+        }`}
+      >
+        <span
+          aria-hidden="true"
+          className={`pointer-events-none inline-block h-4 w-4 rounded-full transition-transform duration-200 ${
+            checked ? 'translate-x-[18px] bg-neutral-950' : 'translate-x-[2px] bg-white/85'
+          }`}
+        />
+      </button>
+    </div>
+  );
+}
 
 export function PrismBar({
   settings,
   onSettingsChange,
   modeToast,
-  gpuInfo,
+  cameras,
+  selectedCameraId,
+  cameraPreset,
+  onSelectCamera,
+  onSelectCameraPreset,
   fpsTextRef,
   aiFpsTextRef,
   modeTextRef,
-  lightingBadgeRef,
-  lightingTextRef,
+  lowLightDotRef,
   uiRootRef,
   dockNavRef,
   toolsOpen,
   onToggleTools,
   onDockActivity,
   onStepMode,
-  onTriggerWhiteFlash,
   onClearDrawing,
   onClearNote,
 }: PrismBarProps) {
+  const modeBtnRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const [pillRect, setPillRect] = useState<{ x: number; w: number; visible: boolean }>({
+    x: 0,
+    w: 0,
+    visible: false,
+  });
+
+  const activeModeIndex = settings.airDrawEnabled
+    ? -1
+    : MODES.findIndex((m) => m.id === settings.mode);
+
+  useLayoutEffect(() => {
+    const syncPill = () => {
+      if (activeModeIndex < 0) {
+        setPillRect((prev) => (prev.visible ? { ...prev, visible: false } : prev));
+        return;
+      }
+      const btn = modeBtnRefs.current[activeModeIndex];
+      if (!btn) return;
+      const x = btn.offsetLeft;
+      const w = btn.offsetWidth;
+      setPillRect((prev) =>
+        prev.x === x && prev.w === w && prev.visible ? prev : { x, w, visible: true },
+      );
+    };
+
+    syncPill();
+    window.addEventListener('resize', syncPill);
+    return () => window.removeEventListener('resize', syncPill);
+  }, [activeModeIndex]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
+        return;
+      }
       if (e.key === '1') onSettingsChange({ mode: 'AUTO', airDrawEnabled: false });
       else if (e.key === '2') onSettingsChange({ mode: 'GLASS', airDrawEnabled: false });
       else if (e.key === '3') onSettingsChange({ mode: 'THERMAL', airDrawEnabled: false });
       else if (e.key === '4') onSettingsChange({ mode: 'PRISM', airDrawEnabled: false });
-      else if (e.key === '5') onSettingsChange({ mode: 'GALAXY', airDrawEnabled: false });
+      else if (e.key === '5') onSettingsChange({ mode: 'COSMOS', airDrawEnabled: false });
       else if (e.key === '6') onSettingsChange({ mode: 'LIGHTNING', airDrawEnabled: false });
       else if (e.key === '7') onSettingsChange({ mode: 'MYSTIC', airDrawEnabled: false });
       else if (e.key === 'ArrowRight') {
@@ -91,10 +168,6 @@ export function PrismBar({
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
         onStepMode(-1);
-      } else if (e.key === 'f' || e.key === 'F') {
-        if (settings.flashEnabled) {
-          onTriggerWhiteFlash();
-        }
       } else if (e.key === 't' || e.key === 'T') {
         onSettingsChange({ trailEnabled: !settings.trailEnabled });
       } else if (e.key === 'd' || e.key === 'D') {
@@ -107,6 +180,8 @@ export function PrismBar({
         onSettingsChange({ mirrored: !settings.mirrored });
       } else if (e.key === 'n' || e.key === 'N') {
         onSettingsChange({ noteOpen: !settings.noteOpen });
+      } else if (e.key === 'Escape' && toolsOpen) {
+        onToggleTools();
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -114,298 +189,331 @@ export function PrismBar({
   }, [
     onSettingsChange,
     onStepMode,
-    onTriggerWhiteFlash,
+    onToggleTools,
     settings.airDrawEnabled,
     settings.cyberHud,
-    settings.flashEnabled,
     settings.hdDenoise,
     settings.mirrored,
     settings.noteOpen,
     settings.trailEnabled,
+    toolsOpen,
   ]);
-
-  const gpuLabel = !gpuInfo
-    ? 'GPU'
-    : gpuInfo.delegate === 'CPU'
-      ? 'WORKER CPU'
-      : gpuInfo.tier === 'DISCRETE'
-        ? 'RTX GPU'
-        : 'GPU';
 
   return (
     <>
-      {/* Top-left Pro Telemetry: VisionArcade | Render FPS | Worker AI FPS | GPU | Active Mode | Lighting Status */}
+      {/* Top-Left Minimalist Telemetry Pill */}
       <header className="pointer-events-none fixed top-4 left-4 z-20">
-        <div className="pointer-events-auto inline-flex flex-wrap items-center gap-2 rounded-full border border-white/15 bg-black/52 px-3.5 py-1.5 backdrop-blur-md">
-          <span className="text-xs font-semibold text-white">VisionArcade</span>
-          <span className="h-3 w-px bg-white/20" aria-hidden="true" />
-          <span className="font-mono text-xs font-semibold text-white tabular-nums">
-            <span ref={fpsTextRef}>144</span> FPS
+        <div className="pointer-events-auto inline-flex h-7 items-center gap-2 rounded-full border border-white/12 bg-neutral-950/60 px-3 font-mono text-[11px] backdrop-blur-2xl">
+          <span className="font-sans text-[11px] font-semibold tracking-tight text-white/95">
+            VisionArcade
           </span>
-          <span className="h-3 w-px bg-white/20" aria-hidden="true" />
-          <span className="font-mono text-[11px] text-[#67e8f9] tabular-nums">
+          <span className="text-white/25" aria-hidden="true">
+            ·
+          </span>
+          <span className="inline-flex items-center gap-1.5 text-white/90 tabular-nums">
+            <span
+              aria-hidden="true"
+              className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.75)]"
+            />
+            <span>
+              <span ref={fpsTextRef}>60</span> FPS
+            </span>
+          </span>
+          <span className="text-white/25" aria-hidden="true">
+            ·
+          </span>
+          <span className="text-white/55 tabular-nums">
             AI <span ref={aiFpsTextRef}>30</span>
           </span>
-          <span className="h-3 w-px bg-white/20" aria-hidden="true" />
-          <span title={gpuInfo?.renderer ?? ''} className="font-mono text-[11px] text-white/75">
-            {gpuLabel}
+          <span className="text-white/25" aria-hidden="true">
+            ·
           </span>
-          <span className="h-3 w-px bg-white/20" aria-hidden="true" />
-          <span ref={modeTextRef} className="font-mono text-[11px] font-medium text-white">
+          <span
+            ref={modeTextRef}
+            className="font-medium tracking-[0.05em] text-white/90 uppercase"
+          >
             {settings.airDrawEnabled ? 'AIR DRAW' : settings.mode}
           </span>
-          <span className="h-3 w-px bg-white/20" aria-hidden="true" />
           <span
-            ref={lightingBadgeRef}
-            className="inline-flex items-center gap-1 font-mono text-[11px] text-[#4ade80]"
-          >
-            <Sun className="h-3 w-3 shrink-0" aria-hidden="true" />
-            <span ref={lightingTextRef}>LIGHT OK</span>
-          </span>
+            ref={lowLightDotRef}
+            title="Low-Light Boost Active"
+            aria-label="Low-Light Boost Active"
+            style={{ display: 'none' }}
+            className="ml-0.5 h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.75)]"
+          />
         </div>
       </header>
 
-      {/* Center-top 0.9s Neon HUD Toast when switching mode via Air Swipe or Arrow keys */}
+      {/* Center-Top 1.0s Monochrome Glass Mode Banner */}
       {modeToast && (
         <div
+          key={modeToast.key}
           role="status"
           aria-live="polite"
-          className="pointer-events-none fixed top-5 left-1/2 z-30 -translate-x-1/2 rounded-full border border-[#22d3ee]/60 bg-black/70 px-4 py-1.5 backdrop-blur-lg"
+          className="mode-banner-reveal pointer-events-none fixed top-5 left-1/2 z-30 rounded-full border border-white/15 bg-neutral-950/70 px-4 py-1.5 backdrop-blur-2xl"
         >
-          <span className="font-mono text-xs font-semibold text-[#e0f2fe]">{modeToast}</span>
+          <span className="font-mono text-[11px] font-medium tracking-[0.14em] text-white/95 uppercase">
+            {modeToast.text}
+          </span>
         </div>
       )}
 
-      {/* Observed UI Container for ResizeObserver + MutationObserver Magnetic Hitbox sync */}
+      {/* Observed UI Root for Air-Cursor Magnetic Hitboxes */}
       <div ref={uiRootRef} className="pointer-events-none fixed inset-0 z-20">
-        {/* Tools Popover Drawer above Dock */}
+        {/* Right-Side Floating Inspector Panel (Never Covers Face) */}
         {toolsOpen && (
-          <div
+          <aside
             role="dialog"
-            aria-label="Công cụ và bộ lọc"
+            aria-label="Studio Settings"
+            data-testid="studio-inspector"
             onPointerMove={onDockActivity}
-            className="pointer-events-auto fixed bottom-18 left-1/2 flex w-[min(92vw,340px)] -translate-x-1/2 flex-col gap-2 rounded-2xl border border-white/18 bg-[#080b12]/88 p-2.5 backdrop-blur-xl"
+            className="inspector-panel-enter pointer-events-auto fixed right-4 bottom-20 z-30 flex w-[288px] flex-col gap-3 rounded-2xl border border-white/12 bg-neutral-950/60 p-3.5 shadow-[0_24px_64px_rgba(0,0,0,0.55)] backdrop-blur-2xl"
           >
-            <div className="grid grid-cols-2 gap-1.5">
-              <button
-                type="button"
-                data-air-clickable="true"
-                aria-pressed={settings.trailEnabled}
-                onClick={() => onSettingsChange({ trailEnabled: !settings.trailEnabled })}
-                className={`inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-medium transition-colors ${
-                  settings.trailEnabled
-                    ? 'bg-white/20 text-white'
-                    : 'bg-white/5 text-white/75 hover:bg-white/12 hover:text-white'
-                }`}
-              >
-                <Wind className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                <span>Trail</span>
-              </button>
+            {/* Section 1: Camera Source */}
+            <section className="flex flex-col gap-2 border-b border-white/8 pb-3">
+              <div className="flex items-center justify-between">
+                <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+                  Camera Source
+                </h2>
+                <span className="font-mono text-[10px] text-white/35">Preset</span>
+              </div>
 
-              <button
-                type="button"
-                data-air-clickable="true"
-                aria-pressed={settings.airDrawEnabled}
-                onClick={() => onSettingsChange({ airDrawEnabled: !settings.airDrawEnabled })}
-                className={`inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-medium transition-colors ${
-                  settings.airDrawEnabled
-                    ? 'bg-[#22d3ee] text-black'
-                    : 'bg-white/5 text-white/75 hover:bg-white/12 hover:text-white'
-                }`}
-              >
-                <Brush className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                <span>Air Draw</span>
-              </button>
+              <div className="relative">
+                <select
+                  aria-label="Camera"
+                  value={selectedCameraId}
+                  onChange={(e) => onSelectCamera(e.target.value)}
+                  className="h-8 w-full appearance-none rounded-lg border border-white/10 bg-white/[0.06] pr-7 pl-2.5 text-xs text-white/90 transition-colors hover:bg-white/[0.1] focus:border-white/30 focus:outline-none"
+                >
+                  {cameras.length === 0 ? (
+                    <option value="" className="bg-neutral-900 text-white">
+                      Default Camera
+                    </option>
+                  ) : (
+                    cameras.map((cam) => (
+                      <option
+                        key={cam.deviceId}
+                        value={cam.deviceId}
+                        className="bg-neutral-900 text-white"
+                      >
+                        {cam.label}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <ChevronDown
+                  className="pointer-events-none absolute top-1/2 right-2.5 h-3.5 w-3.5 -translate-y-1/2 text-white/50"
+                  aria-hidden="true"
+                />
+              </div>
 
-              <button
-                type="button"
-                data-air-clickable="true"
-                aria-pressed={settings.hdDenoise}
-                onClick={() => onSettingsChange({ hdDenoise: !settings.hdDenoise })}
-                className={`inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-medium transition-colors ${
-                  settings.hdDenoise
-                    ? 'bg-white/20 text-[#67e8f9]'
-                    : 'bg-white/5 text-white/75 hover:bg-white/12 hover:text-white'
-                }`}
+              <div
+                role="group"
+                aria-label="Resolution Preset"
+                className="grid grid-cols-3 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
               >
-                <Sliders className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                <span>HD+ Denoise</span>
-              </button>
+                {CAMERA_PRESETS.map((preset) => {
+                  const active = cameraPreset === preset.id;
+                  return (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      data-air-clickable="true"
+                      aria-pressed={active}
+                      onClick={() => onSelectCameraPreset(preset.id)}
+                      className={`inline-flex h-6 items-center justify-center rounded-md text-[11px] font-medium transition-colors duration-200 ${
+                        active
+                          ? 'bg-white text-black shadow-xs'
+                          : 'text-white/60 hover:text-white'
+                      }`}
+                    >
+                      {preset.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
 
-              <button
-                type="button"
-                data-air-clickable="true"
-                aria-pressed={settings.cyberHud}
-                onClick={() => onSettingsChange({ cyberHud: !settings.cyberHud })}
-                className={`inline-flex h-9 items-center gap-2 rounded-lg px-3 text-xs font-medium transition-colors ${
-                  settings.cyberHud
-                    ? 'bg-white/20 text-[#a5f3fc]'
-                    : 'bg-white/5 text-white/75 hover:bg-white/12 hover:text-white'
-                }`}
-              >
-                <Cpu className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                <span>Cyber HUD</span>
-              </button>
+            {/* Section 2: Studio Controls */}
+            <section className="flex flex-col gap-1">
+              <h2 className="mb-1 text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+                Studio Controls
+              </h2>
+              <StudioToggleRow
+                label="Trail"
+                checked={settings.trailEnabled}
+                onToggle={() => onSettingsChange({ trailEnabled: !settings.trailEnabled })}
+              />
+              <StudioToggleRow
+                label="Air Draw"
+                checked={settings.airDrawEnabled}
+                onToggle={() => onSettingsChange({ airDrawEnabled: !settings.airDrawEnabled })}
+              />
+              <StudioToggleRow
+                label="Cinema Denoise"
+                checked={settings.hdDenoise}
+                onToggle={() => onSettingsChange({ hdDenoise: !settings.hdDenoise })}
+              />
+              <StudioToggleRow
+                label="Cyber HUD"
+                checked={settings.cyberHud}
+                onToggle={() => onSettingsChange({ cyberHud: !settings.cyberHud })}
+              />
+              <StudioToggleRow
+                label="Mirror"
+                checked={settings.mirrored}
+                onToggle={() => onSettingsChange({ mirrored: !settings.mirrored })}
+              />
+              <StudioToggleRow
+                label="Thunder SFX"
+                checked={settings.sfxEnabled}
+                onToggle={() => onSettingsChange({ sfxEnabled: !settings.sfxEnabled })}
+              />
+            </section>
 
-              <button
-                type="button"
-                data-air-clickable="true"
-                aria-pressed={settings.mirrored}
-                onClick={() => onSettingsChange({ mirrored: !settings.mirrored })}
-                className={`${
-                  settings.noteOpen ? '' : 'col-span-2'
-                } inline-flex h-9 items-center justify-center gap-2 rounded-lg px-3 text-xs font-medium transition-colors ${
-                  settings.mirrored
-                    ? 'bg-white/18 text-white'
-                    : 'bg-white/5 text-white/70 hover:bg-white/12 hover:text-white'
-                }`}
-              >
-                <FlipHorizontal2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                <span>Mirror</span>
-              </button>
+            {/* Section 3: Air Draw Palette (revealed smoothly when Air Draw is active) */}
+            {settings.airDrawEnabled && (
+              <section className="flex flex-col gap-2 border-t border-white/8 pt-3">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+                    Air Draw Palette
+                  </h2>
+                  <button
+                    type="button"
+                    data-air-clickable="true"
+                    onClick={onClearDrawing}
+                    className="rounded px-1.5 py-0.5 text-[11px] font-medium text-white/60 transition-colors hover:text-white"
+                  >
+                    Clear
+                  </button>
+                </div>
+                <div className="flex items-center gap-3 px-0.5 py-0.5">
+                  {DRAW_COLOR_KEYS.map((key) => {
+                    const color = AIR_DRAW_COLORS[key];
+                    const selected = settings.drawColor === key;
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        data-air-clickable="true"
+                        aria-label={`Color ${color.label}`}
+                        aria-pressed={selected}
+                        onClick={() => onSettingsChange({ drawColor: key })}
+                        className={`h-5 w-5 rounded-full transition-opacity duration-150 ${
+                          selected
+                            ? 'ring-2 ring-white ring-offset-2 ring-offset-neutral-950'
+                            : 'opacity-70 hover:opacity-100'
+                        }`}
+                        style={{ backgroundColor: color.hex }}
+                      />
+                    );
+                  })}
+                </div>
+              </section>
+            )}
 
-              {settings.noteOpen && (
+            {/* Optional Note 3D Quick Clear when Note 3D is open */}
+            {settings.noteOpen && (
+              <section className="flex items-center justify-between border-t border-white/8 pt-2.5">
+                <span className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+                  Note 3D
+                </span>
                 <button
                   type="button"
                   data-air-clickable="true"
                   onClick={onClearNote}
-                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-white/8 px-3 text-xs font-medium text-white/90 transition-colors hover:bg-white/18"
+                  className="rounded px-1.5 py-0.5 text-[11px] font-medium text-white/60 transition-colors hover:text-white"
                 >
-                  <Trash2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                  <span>Xóa chữ 3D</span>
+                  Clear
                 </button>
-              )}
-            </div>
-
-            {settings.airDrawEnabled && (
-              <div className="flex items-center justify-between border-t border-white/10 pt-2">
-                <div className="flex items-center gap-1.5">
-                  {DRAW_COLOR_KEYS.map((cid) => {
-                    const c = AIR_DRAW_COLORS[cid];
-                    const active = settings.drawColor === cid;
-                    return (
-                      <button
-                        key={cid}
-                        type="button"
-                        data-air-clickable="true"
-                        aria-label={c.label}
-                        aria-pressed={active}
-                        onClick={() => onSettingsChange({ drawColor: cid })}
-                        className={`inline-flex h-8 w-8 items-center justify-center rounded-lg border transition-colors ${
-                          active ? 'border-white bg-white/18' : 'border-white/15 bg-white/5'
-                        }`}
-                      >
-                        <span
-                          className="block h-3.5 w-3.5 rounded-xs"
-                          style={{ backgroundColor: c.hex }}
-                          aria-hidden="true"
-                        />
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <button
-                  type="button"
-                  data-air-clickable="true"
-                  onClick={onClearDrawing}
-                  className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-white/8 px-2.5 text-[11px] font-medium text-white/90 transition-colors hover:bg-white/18"
-                >
-                  <Eraser className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>Xóa nét</span>
-                </button>
-              </div>
+              </section>
             )}
-          </div>
+          </aside>
         )}
 
-        {/* Single slim VisionOS/macOS Floating Dock (~44px height) with Auto-Wake spring */}
+        {/* Bottom Centered VisionOS Floating Dock */}
         <nav
           ref={dockNavRef}
-          aria-label="Thanh Dock điều khiển hiệu ứng"
+          aria-label="Effect Modes and Tools"
+          data-testid="floating-dock"
           onPointerEnter={onDockActivity}
           onPointerMove={onDockActivity}
-          style={{ transform: 'translateX(-50%) scale(1)' }}
-          className="pointer-events-auto fixed bottom-4 left-1/2 flex h-11 max-w-[96vw] items-center gap-1 whitespace-nowrap rounded-full border border-white/20 bg-black/48 px-1.5 backdrop-blur-xl transition-[opacity,transform] duration-300 ease-out"
+          style={{ transform: 'translateX(-50%) scale(1)', opacity: 1 }}
+          className="pointer-events-auto fixed bottom-5 left-1/2 flex h-11 max-w-[96vw] items-center gap-1 rounded-full border border-white/12 bg-neutral-950/60 px-2 shadow-[0_16px_48px_rgba(0,0,0,0.48)] backdrop-blur-2xl transition-[opacity,transform] duration-300 ease-out"
         >
-          {/* Left Group: Modes */}
-          <div className="flex shrink-0 items-center gap-0.5" role="group" aria-label="Chế độ hiệu ứng">
-            {MODES.map((m) => {
+          {/* Core Mode Buttons with Smooth Sliding Active Pill */}
+          <div className="relative flex items-center gap-0.5">
+            <span
+              aria-hidden="true"
+              style={{
+                transform: `translate3d(${pillRect.x}px, 0, 0)`,
+                width: `${pillRect.w}px`,
+                opacity: pillRect.visible ? 1 : 0,
+              }}
+              className="pointer-events-none absolute top-0 bottom-0 left-0 rounded-full bg-white shadow-xs transition-[transform,width,opacity] duration-250 ease-out"
+            />
+            {MODES.map((m, idx) => {
               const Icon = m.icon;
               const active = !settings.airDrawEnabled && settings.mode === m.id;
               return (
                 <button
                   key={m.id}
+                  ref={(el) => {
+                    modeBtnRefs.current[idx] = el;
+                  }}
                   type="button"
                   data-air-clickable="true"
+                  data-dock-item={m.id}
                   aria-pressed={active}
+                  title={`${m.label} (${m.keyHint})`}
                   onClick={() => onSettingsChange({ mode: m.id, airDrawEnabled: false })}
-                  title={`${m.label} (Phím ${m.keyHint})`}
-                  className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-xs font-medium transition-colors ${
-                    active
-                      ? 'bg-white text-black'
-                      : 'text-white/78 hover:bg-white/12 hover:text-white'
+                  className={`relative z-10 inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-xs transition-colors duration-200 ${
+                    active ? 'font-medium text-black' : 'text-white/65 hover:text-white'
                   }`}
                 >
                   <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                  <span className="hidden md:inline">{m.label}</span>
+                  <span className="hidden sm:inline">{m.label}</span>
                 </button>
               );
             })}
           </div>
 
-          <span className="mx-0.5 h-5 w-px shrink-0 bg-white/20" aria-hidden="true" />
+          <span className="mx-1 h-5 w-px shrink-0 bg-white/15" aria-hidden="true" />
 
-          {/* Right Group: Tools Popover + Standalone White Flash + 3D Note */}
-          <div className="flex shrink-0 items-center gap-1">
-            <button
-              type="button"
-              data-air-clickable="true"
-              aria-expanded={toolsOpen}
-              onClick={onToggleTools}
-              title="Mở bảng công cụ (Trail, Air Draw, HD+ Denoise, Cyber HUD, Mirror)"
-              aria-label="Mở bảng công cụ"
-              className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors ${
-                toolsOpen || settings.airDrawEnabled
-                  ? 'bg-white/22 text-[#67e8f9]'
-                  : 'text-white/80 hover:bg-white/12 hover:text-white'
-              }`}
-            >
-              <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
-            </button>
+          {/* Compact Utility Icons: Note 3D & Settings */}
+          <button
+            type="button"
+            data-air-clickable="true"
+            data-dock-item="NOTE_3D"
+            aria-pressed={settings.noteOpen}
+            aria-label="Note 3D"
+            title="Note 3D (N)"
+            onClick={() => onSettingsChange({ noteOpen: !settings.noteOpen })}
+            className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors duration-200 ${
+              settings.noteOpen
+                ? 'bg-white text-black'
+                : 'text-white/65 hover:bg-white/10 hover:text-white'
+            }`}
+          >
+            <BookOpen className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
 
-            <button
-              type="button"
-              data-air-clickable="true"
-              aria-pressed={settings.flashEnabled}
-              onClick={() => onSettingsChange({ flashEnabled: !settings.flashEnabled })}
-              title="Bật/tắt Flash trắng toàn màn hình (Búng tay hoặc phím F khi đang bật)"
-              aria-label="Bật/tắt Flash trắng toàn màn hình"
-              className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors ${
-                settings.flashEnabled
-                  ? 'bg-[#fde047] text-black'
-                  : 'text-white/80 hover:bg-white/12 hover:text-white'
-              }`}
-            >
-              <Zap className="h-3.5 w-3.5" aria-hidden="true" />
-            </button>
-
-            <button
-              type="button"
-              data-air-clickable="true"
-              aria-pressed={settings.noteOpen}
-              onClick={() => onSettingsChange({ noteOpen: !settings.noteOpen })}
-              title="Bật/tắt Chữ 3D Hologram (Phím N)"
-              aria-label="Bật/tắt Chữ 3D Hologram"
-              className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors ${
-                settings.noteOpen
-                  ? 'bg-[#22d3ee] text-black'
-                  : 'text-white/80 hover:bg-white/12 hover:text-white'
-              }`}
-            >
-              <BookOpen className="h-3.5 w-3.5" aria-hidden="true" />
-            </button>
-          </div>
+          <button
+            type="button"
+            data-air-clickable="true"
+            data-dock-item="SETTINGS"
+            aria-expanded={toolsOpen}
+            aria-label="Settings"
+            title="Settings"
+            onClick={onToggleTools}
+            className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors duration-200 ${
+              toolsOpen
+                ? 'bg-white text-black'
+                : 'text-white/65 hover:bg-white/10 hover:text-white'
+            }`}
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
         </nav>
       </div>
     </>

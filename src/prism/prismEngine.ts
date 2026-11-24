@@ -1,11 +1,11 @@
-import { GalaxyFx } from '../fx/galaxy';
-import { LightningFx } from '../fx/lightning';
+import { Cosmos3DEngine } from '../fx/cosmos';
 import { MysticFx } from '../fx/mystic';
 import {
   buildOpticalPolygons,
   renderPrismChromaticEdges,
   renderTrailOutline,
 } from '../fx/prism';
+import { TransitionManager } from '../fx/transitionManager';
 import type { HandPose2D, Point2D, RenderPolygon } from '../fx/types';
 import type {
   AirDrawColorId,
@@ -14,6 +14,8 @@ import type {
   Landmark3D,
   PrismSettings,
 } from '../types/vision';
+import type { SwipeIndicatorState } from '../vision/gestureManager';
+import { OneEuroAxis } from '../vision/smoothing';
 import { drawCyberneticHandHud } from './cyberHud';
 
 export type { Point2D };
@@ -44,10 +46,19 @@ interface SwipeSwoosh {
   duration: number;
 }
 
+interface PolyDissolveGhost {
+  pts: Point2D[];
+  cx: number;
+  cy: number;
+  color: string;
+  age: number;
+  duration: number;
+  motes: { x: number; y: number; vx: number; vy: number }[];
+}
+
 export interface FrameOutput {
   activeMode: CycleModeId;
   indexTipPx: Point2D | null;
-  /** Normalized screen-space [0..1] palm position for 3D Hologram Text parallax. */
   palmScreenNorm: Point2D | null;
   isLeadFist: boolean;
 }
@@ -59,7 +70,9 @@ export const AIR_DRAW_COLORS: Record<AirDrawColorId, { hex: string; label: strin
   GOLD: { hex: '#facc15', label: 'Gold' },
 };
 
-const GRACE_FRAMES = 5;
+const HAND_PERSISTENCE_SEC = 0.18;
+const ONE_EURO_MIN_CUTOFF = 1.2;
+const ONE_EURO_BETA = 0.04;
 const TRAIL_MAX_FRAMES = 14;
 
 const VERT_SRC = `#version 300 es
@@ -82,11 +95,13 @@ precision highp float;
 in vec2 vScreenUv;
 
 uniform sampler2D uVideo;
+uniform sampler2D uPrevFrame;
 uniform vec2 uCoverScale;
 uniform vec2 uVideoTexel;
 uniform float uMirrored;
 uniform float uEnhance;
-uniform int uShaderType; // 0 = GLASS, 1 = THERMAL, 2 = PRISM_BAND, 4 = WEBCAM_HD_PIPELINE
+uniform float uHasPrev;
+uniform int uShaderType; // 0=GLASS, 1=THERMAL, 2=PRISM, 4=CINEMA_CLEAN_PASS1, 5=BLIT_FBO
 uniform vec4 uTint;
 
 out vec4 fragColor;
@@ -101,8 +116,30 @@ float lumaOf(vec3 c) {
   return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
+vec3 rgbToYCbCr(vec3 c) {
+  float y  =  0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+  float cb = -0.168736 * c.r - 0.331264 * c.g + 0.5 * c.b;
+  float cr =  0.5 * c.r - 0.418688 * c.g - 0.081312 * c.b;
+  return vec3(y, cb, cr);
+}
+
+vec3 yCbCrToRgb(vec3 ycc) {
+  float r = ycc.x + 1.402 * ycc.z;
+  float g = ycc.x - 0.344136 * ycc.y - 0.714136 * ycc.z;
+  float b = ycc.x + 1.772 * ycc.y;
+  return clamp(vec3(r, g, b), 0.0, 1.0);
+}
+
+vec3 acesFilmic(vec3 x) {
+  float a = 2.51;
+  float b = 0.03;
+  float c = 2.43;
+  float d = 0.59;
+  float e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
 vec3 thermalFalseColor(float t) {
-  // High-vibrance vivid false-color ramp: Deep Cobalt -> Electric Violet -> Hot Pink -> Molten Orange -> Blazing Yellow
   vec3 c0 = vec3(0.02, 0.08, 0.42);
   vec3 c1 = vec3(0.45, 0.08, 0.92);
   vec3 c2 = vec3(1.00, 0.08, 0.64);
@@ -114,7 +151,14 @@ vec3 thermalFalseColor(float t) {
   return mix(c3, c4, clamp((t - 0.75) / 0.25, 0.0, 1.0));
 }
 
-vec3 enhanceWebcamHD(vec2 uv) {
+/**
+ * Cinema Clean GPU Pipeline:
+ * 1. Motion-Adaptive Temporal Denoise (mix 35% prev frame when diff < 0.08 — zero ghosting)
+ * 2. YCbCr Chroma Smoothing (erases red/green low-light blotches while keeping Luma sharp)
+ * 3. Edge-Gated CAS Sharpening
+ * 4. ACES Filmic Highlight Compression (luma > 0.72) + Cool Shadow Cinema Grade + 0.25 Vignette
+ */
+vec3 cinemaCleanPass(vec2 uv, vec2 fboUv) {
   vec3 c = texture(uVideo, uv).rgb;
   if (uEnhance <= 0.005) return c;
 
@@ -129,58 +173,102 @@ vec3 enhanceWebcamHD(vec2 uv) {
   vec3 sw = texture(uVideo, clamp(uv + vec2(-t.x,  t.y), 0.002, 0.998)).rgb;
 
   float lc = lumaOf(c);
+  float shadowMask = 1.0 - smoothstep(0.08, 0.50, lc);
 
-  // 1. 3x3 (9-tap) Low-Light Bilateral Denoise
-  float shadowMask = 1.0 - smoothstep(0.08, 0.48, lc);
-  float sigmaColor = mix(0.045, 0.145, shadowMask);
-  float inv2Sigma2 = 1.0 / (2.0 * sigmaColor * sigmaColor);
+  // 1. Spatial 3x3 Bilateral Denoise + Separate Chroma (Cb/Cr) Smoothing
+  float sigmaLuma = mix(0.04, 0.12, shadowMask);
+  float inv2SigmaL = 1.0 / (2.0 * sigmaLuma * sigmaLuma);
+  float inv2SigmaC = 1.0 / (2.0 * 0.19 * 0.19); // wider chroma filter wipes color noise on skin/walls
 
-  vec3 acc = c;
-  float wSum = 1.0;
+  vec3 yccC = rgbToYCbCr(c);
+  float yAcc = yccC.x;
+  float yW = 1.0;
+  vec2 cbcrAcc = yccC.yz;
+  float cW = 1.0;
 
-  vec3 dN = n - c;  float wN = exp(-dot(dN, dN) * inv2Sigma2) * 0.85; acc += n * wN; wSum += wN;
-  vec3 dS = s - c;  float wS = exp(-dot(dS, dS) * inv2Sigma2) * 0.85; acc += s * wS; wSum += wS;
-  vec3 dE = e - c;  float wE = exp(-dot(dE, dE) * inv2Sigma2) * 0.85; acc += e * wE; wSum += wE;
-  vec3 dW = w - c;  float wW = exp(-dot(dW, dW) * inv2Sigma2) * 0.85; acc += w * wW; wSum += wW;
-  vec3 dNE = ne - c; float wNE = exp(-dot(dNE, dNE) * inv2Sigma2) * 0.6; acc += ne * wNE; wSum += wNE;
-  vec3 dNW = nw - c; float wNW = exp(-dot(dNW, dNW) * inv2Sigma2) * 0.6; acc += nw * wNW; wSum += wNW;
-  vec3 dSE = se - c; float wSE = exp(-dot(dSE, dSE) * inv2Sigma2) * 0.6; acc += se * wSE; wSum += wSE;
-  vec3 dSW = sw - c; float wSW = exp(-dot(dSW, dSW) * inv2Sigma2) * 0.6; acc += sw * wSW; wSum += wSW;
+  vec3 nbrs[8];
+  nbrs[0] = n; nbrs[1] = s; nbrs[2] = e; nbrs[3] = w;
+  nbrs[4] = ne; nbrs[5] = nw; nbrs[6] = se; nbrs[7] = sw;
 
-  vec3 denoised = acc / wSum;
+  for (int i = 0; i < 8; i++) {
+    vec3 nb = nbrs[i];
+    vec3 yccN = rgbToYCbCr(nb);
+    float spW = (i < 4) ? 0.85 : 0.6;
+    float dy = yccN.x - yccC.x;
+    float wl = exp(-(dy * dy) * inv2SigmaL) * spW;
+    yAcc += yccN.x * wl;
+    yW += wl;
 
-  // 2. Contrast Adaptive Sharpening (CAS / edge-gated unsharp mask)
-  vec3 mn = min(min(min(n, s), min(e, w)), denoised);
-  vec3 mx = max(max(max(n, s), max(e, w)), denoised);
-  float localContrast = lumaOf(mx - mn);
-  float edgeGate = smoothstep(0.04, 0.18, localContrast) * (1.0 - shadowMask * 0.65);
-  vec3 crossAvg = (n + s + e + w) * 0.25;
-  vec3 sharpened = denoised + (denoised - crossAvg) * (0.68 * edgeGate);
-  sharpened = clamp(sharpened, 0.0, 1.0);
+    vec3 diffRgb = nb - c;
+    float wc = exp(-dot(diffRgb, diffRgb) * inv2SigmaC) * spW;
+    cbcrAcc += yccN.yz * wc;
+    cW += wc;
+  }
 
-  // 3. Highlight Roll-off & Cinematic Black-Level Tone Mapping
-  float lum = lumaOf(sharpened);
-  float rolledLum = (lum > 0.72) ? (0.72 + (lum - 0.72) / (1.0 + (lum - 0.72) * 2.2)) : lum;
-  vec3 toned = sharpened * (rolledLum / max(lum, 0.0001));
-  toned = clamp((toned - 0.025) * 1.055, 0.0, 1.0);
-  toned = mix(toned, toned * toned * (3.0 - 2.0 * toned), 0.14);
+  float denoisedY = yAcc / yW;
+  vec2 smoothCbCr = cbcrAcc / cW;
 
-  return mix(c, clamp(toned, 0.0, 1.0), clamp(uEnhance, 0.0, 1.0));
+  // 2. Edge-Gated CAS Sharpening on Luma channel ONLY (preserves crisp eyes/hair without chroma noise)
+  float minY = min(min(min(lumaOf(n), lumaOf(s)), min(lumaOf(e), lumaOf(w))), denoisedY);
+  float maxY = max(max(max(lumaOf(n), lumaOf(s)), max(lumaOf(e), lumaOf(w))), denoisedY);
+  float edgeGate = smoothstep(0.04, 0.18, maxY - minY) * (1.0 - shadowMask * 0.6);
+  float crossY = (lumaOf(n) + lumaOf(s) + lumaOf(e) + lumaOf(w)) * 0.25;
+  float sharpY = clamp(denoisedY + (denoisedY - crossY) * (0.65 * edgeGate), 0.0, 1.0);
+
+  vec3 clean = yCbCrToRgb(vec3(sharpY, smoothCbCr));
+
+  // 3. Motion-Adaptive Temporal Denoise (35% prev frame blend where diff < 0.08)
+  if (uHasPrev > 0.5) {
+    vec3 prev = texture(uPrevFrame, fboUv).rgb;
+    float diff = length(clean - prev);
+    float temporalWeight = 0.35 * (1.0 - smoothstep(0.025, 0.08, diff));
+    clean = mix(clean, prev, temporalWeight);
+  }
+
+  // 4. ACES Filmic Highlight Compression (luma > 0.72) + Cinema Grade + Soft Vignette (0.25)
+  float lum = lumaOf(clean);
+  if (lum > 0.72) {
+    vec3 filmic = acesFilmic(clean * 1.15);
+    float hiBlend = smoothstep(0.72, 0.98, lum);
+    clean = mix(clean, filmic, hiBlend * 0.78);
+  }
+
+  // Subtle cool-slate deep shadows & natural skin midtones
+  vec3 coolShadow = vec3(0.95, 0.98, 1.04);
+  clean *= mix(vec3(1.0), coolShadow, shadowMask * 0.35);
+  clean = clamp((clean - 0.02) * 1.04, 0.0, 1.0);
+
+  // Soft radial vignette (0.25)
+  vec2 vig = vScreenUv - 0.5;
+  float vigFactor = 1.0 - dot(vig, vig) * 0.92;
+  clean *= mix(1.0, clamp(vigFactor, 0.75, 1.0), 0.95);
+
+  return mix(c, clamp(clean, 0.0, 1.0), clamp(uEnhance, 0.0, 1.0));
 }
 
 void main() {
-  vec2 uv = clamp(screenToVideoUv(vScreenUv), vec2(0.002), vec2(0.998));
-
-  if (uShaderType == 4) {
-    fragColor = vec4(enhanceWebcamHD(uv), 1.0);
+  if (uShaderType == 5) {
+    // Pass 2: Fast blit of Cinema Clean FBO
+    vec2 fboUv = vec2(vScreenUv.x, 1.0 - vScreenUv.y);
+    fragColor = vec4(texture(uPrevFrame, fboUv).rgb, 1.0);
     return;
   }
 
-  vec3 cam = enhanceWebcamHD(uv);
+  vec2 uv = clamp(screenToVideoUv(vScreenUv), vec2(0.002), vec2(0.998));
+
+  if (uShaderType == 4) {
+    // Pass 1: Cinema Clean into FBO
+    vec2 fboUv = vec2(vScreenUv.x, 1.0 - vScreenUv.y);
+    fragColor = vec4(cinemaCleanPass(uv, fboUv), 1.0);
+    return;
+  }
+
+  // Optical Polygons read cleanly from the already Cinema-Clean FBO texture
+  vec2 fboUv = vec2(vScreenUv.x, 1.0 - vScreenUv.y);
+  vec3 cam = texture(uPrevFrame, fboUv).rgb;
   float luma = lumaOf(cam);
 
   if (uShaderType == 0) {
-    // Glass Triangle: luminous crisp optical glass
     vec3 col = cam * 1.44;
     col = (col - 0.5) * 1.34 + 0.5;
     float gLuma = lumaOf(col);
@@ -191,7 +279,6 @@ void main() {
   }
 
   if (uShaderType == 1) {
-    // Thermal False-Color with boosted vibrance & crisp edge contrast
     vec2 t = uVideoTexel * 2.0;
     float lR = lumaOf(texture(uVideo, clamp(uv + vec2(t.x, 0.0), 0.002, 0.998)).rgb);
     float lU = lumaOf(texture(uVideo, clamp(uv + vec2(0.0, t.y), 0.002, 0.998)).rgb);
@@ -202,7 +289,7 @@ void main() {
     return;
   }
 
-  // Chromatic Prism Ribbon: high-contrast vivid additive glass
+  // Chromatic Prism Ribbon
   float hiContrast = clamp((luma - 0.48) * 1.48 + 0.64, 0.28, 1.36);
   vec3 prismCol = uTint.rgb * hiContrast;
   fragColor = vec4(prismCol, uTint.a);
@@ -267,25 +354,73 @@ export function normToScreen(
   return { x: u * viewW, y: v * viewH };
 }
 
-/** Zero-GC 21-Joint 144Hz deltaTime-aware velocity-adaptive interpolator. */
+/**
+ * Zero-GC 21-Joint Hand Tracker Smoother:
+ * - Nearest-distance stable slot ID matching (never swaps hand IDs based on MediaPipe array order)
+ * - Synced One-Euro Filter (minCutoff: 1.2, beta: 0.04) across all 21 joints
+ * - 180ms Hand Persistence grace period with gentle confidence taper on transient frame drops
+ */
 class FullHandInterpolator {
   private buffers: [Float32Array, Float32Array] = [new Float32Array(42), new Float32Array(42)];
+  private filters: [OneEuroAxis[], OneEuroAxis[]];
   private activeFlags: [boolean, boolean] = [false, false];
-  private missedFrames: [number, number] = [0, 0];
+  private missedSec: [number, number] = [0, 0];
   private poses: [HandPose2D, HandPose2D];
 
   constructor() {
+    this.filters = [
+      Array.from({ length: 42 }, () => new OneEuroAxis()),
+      Array.from({ length: 42 }, () => new OneEuroAxis()),
+    ];
     this.poses = [
-      { pts: this.buffers[0], palmX: 0, palmY: 0, palmScale: 80, palmSpeedMps: 0, gesture: 'IDLE' },
-      { pts: this.buffers[1], palmX: 0, palmY: 0, palmScale: 80, palmSpeedMps: 0, gesture: 'IDLE' },
+      {
+        id: 0,
+        pts: this.buffers[0],
+        palmX: 0,
+        palmY: 0,
+        palmScale: 80,
+        palmSpeedMps: 0,
+        confidence: 1,
+        gesture: 'IDLE',
+      },
+      {
+        id: 1,
+        pts: this.buffers[1],
+        palmX: 0,
+        palmY: 0,
+        palmScale: 80,
+        palmSpeedMps: 0,
+        confidence: 1,
+        gesture: 'IDLE',
+      },
     ];
   }
 
   reset(): void {
     this.activeFlags[0] = false;
     this.activeFlags[1] = false;
-    this.missedFrames[0] = 0;
-    this.missedFrames[1] = 0;
+    this.missedSec[0] = 0;
+    this.missedSec[1] = 0;
+    for (let s = 0; s < 2; s += 1) {
+      for (let i = 0; i < 42; i += 1) this.filters[s][i].reset();
+    }
+  }
+
+  private getScreenPalm(
+    hand: Landmark3D[],
+    viewW: number,
+    viewH: number,
+    coverX: number,
+    coverY: number,
+    mirrored: boolean,
+  ): { x: number; y: number } {
+    const rawX = (hand[0].x + hand[5].x + hand[9].x + hand[17].x) * 0.25;
+    const rawY = (hand[0].y + hand[5].y + hand[9].y + hand[17].y) * 0.25;
+    const mx = mirrored ? 1 - rawX : rawX;
+    return {
+      x: ((mx - 0.5) / coverX + 0.5) * viewW,
+      y: ((rawY - 0.5) / coverY + 0.5) * viewH,
+    };
   }
 
   update(
@@ -301,43 +436,99 @@ class FullHandInterpolator {
   ): void {
     outHands.length = 0;
 
-    let h0: Landmark3D[] | undefined = rawHands[0];
-    let g0: GestureType = rawGestures[0] ?? 'IDLE';
-    let h1: Landmark3D[] | undefined = rawHands[1];
-    let g1: GestureType = rawGestures[1] ?? 'IDLE';
-
-    if (h0 && h0.length >= 21 && h1 && h1.length >= 21) {
-      const ax = mirrored ? 1 - h0[9].x : h0[9].x;
-      const bx = mirrored ? 1 - h1[9].x : h1[9].x;
-      if (ax > bx) {
-        const th = h0; h0 = h1; h1 = th;
-        const tg = g0; g0 = g1; g1 = tg;
+    // Collect valid incoming hands (up to 2)
+    const validHands: { hand: Landmark3D[]; gesture: GestureType; px: number; py: number }[] = [];
+    for (let i = 0; i < Math.min(rawHands.length, 2); i += 1) {
+      const h = rawHands[i];
+      if (h && h.length >= 21) {
+        const palm = this.getScreenPalm(h, viewW, viewH, coverX, coverY, mirrored);
+        validHands.push({ hand: h, gesture: rawGestures[i] ?? 'IDLE', px: palm.x, py: palm.y });
       }
     }
 
-    const safeDt = Math.max(dt, 0.004);
+    // Nearest-distance stable slot assignment (prevents ID swapping across frames)
+    const assignedHand: [Landmark3D[] | null, Landmark3D[] | null] = [null, null];
+    const assignedGesture: [GestureType, GestureType] = ['IDLE', 'IDLE'];
+
+    if (validHands.length === 1) {
+      const vh = validHands[0];
+      let targetSlot: 0 | 1 = 0;
+      if (this.activeFlags[0] && this.activeFlags[1]) {
+        const d0 = Math.hypot(vh.px - this.poses[0].palmX, vh.py - this.poses[0].palmY);
+        const d1 = Math.hypot(vh.px - this.poses[1].palmX, vh.py - this.poses[1].palmY);
+        targetSlot = d1 < d0 ? 1 : 0;
+      } else if (this.activeFlags[1] && !this.activeFlags[0]) {
+        targetSlot = 1;
+      }
+      assignedHand[targetSlot] = vh.hand;
+      assignedGesture[targetSlot] = vh.gesture;
+    } else if (validHands.length === 2) {
+      const a = validHands[0];
+      const b = validHands[1];
+      let swap = false;
+      if (this.activeFlags[0] && this.activeFlags[1]) {
+        const costKeep =
+          Math.hypot(a.px - this.poses[0].palmX, a.py - this.poses[0].palmY) +
+          Math.hypot(b.px - this.poses[1].palmX, b.py - this.poses[1].palmY);
+        const costSwap =
+          Math.hypot(a.px - this.poses[1].palmX, a.py - this.poses[1].palmY) +
+          Math.hypot(b.px - this.poses[0].palmX, b.py - this.poses[0].palmY);
+        swap = costSwap < costKeep;
+      } else if (this.activeFlags[0]) {
+        const dA = Math.hypot(a.px - this.poses[0].palmX, a.py - this.poses[0].palmY);
+        const dB = Math.hypot(b.px - this.poses[0].palmX, b.py - this.poses[0].palmY);
+        swap = dB < dA;
+      } else if (this.activeFlags[1]) {
+        const dA = Math.hypot(a.px - this.poses[1].palmX, a.py - this.poses[1].palmY);
+        const dB = Math.hypot(b.px - this.poses[1].palmX, b.py - this.poses[1].palmY);
+        swap = dA < dB;
+      } else {
+        // Fresh 2-hand appearance: deterministic left=0, right=1 initial binding
+        swap = a.px > b.px;
+      }
+
+      if (swap) {
+        assignedHand[0] = b.hand;
+        assignedGesture[0] = b.gesture;
+        assignedHand[1] = a.hand;
+        assignedGesture[1] = a.gesture;
+      } else {
+        assignedHand[0] = a.hand;
+        assignedGesture[0] = a.gesture;
+        assignedHand[1] = b.hand;
+        assignedGesture[1] = b.gesture;
+      }
+    }
+
+    const safeDt = Math.min(Math.max(dt, 0.004), 0.08);
     for (let slot = 0; slot < 2; slot += 1) {
-      const hand = slot === 0 ? h0 : h1;
-      const gesture = slot === 0 ? g0 : g1;
+      const hand = assignedHand[slot];
+      const gesture = assignedGesture[slot];
       const buf = this.buffers[slot];
+      const flt = this.filters[slot];
       const pose = this.poses[slot];
 
-      if (!hand || hand.length < 21) {
-        if (this.activeFlags[slot] && this.missedFrames[slot] < GRACE_FRAMES) {
-          this.missedFrames[slot] += 1;
+      if (!hand) {
+        // Hand Persistence: retain last smoothed pose up to 180ms with gentle confidence decay
+        if (this.activeFlags[slot] && this.missedSec[slot] < HAND_PERSISTENCE_SEC) {
+          this.missedSec[slot] += safeDt;
+          const dropFrac = Math.min(1, this.missedSec[slot] / HAND_PERSISTENCE_SEC);
+          pose.confidence = Math.max(0.35, 1 - dropFrac * 0.65);
           pose.palmSpeedMps *= 0.85;
           outHands.push(pose);
         } else {
           this.activeFlags[slot] = false;
-          this.missedFrames[slot] = 0;
+          this.missedSec[slot] = 0;
+          pose.confidence = 0;
+          for (let i = 0; i < 42; i += 1) flt[i].reset();
         }
         continue;
       }
 
-      this.missedFrames[slot] = 0;
+      const wasActive = this.activeFlags[slot];
+      this.missedSec[slot] = 0;
       const prevPalmX = pose.palmX;
       const prevPalmY = pose.palmY;
-      const wasActive = this.activeFlags[slot];
 
       for (let i = 0; i < 21; i += 1) {
         const lm = hand[i];
@@ -346,20 +537,18 @@ class FullHandInterpolator {
         const ty = ((lm.y - 0.5) / coverY + 0.5) * viewH;
 
         if (!wasActive) {
-          buf[i * 2] = tx;
-          buf[i * 2 + 1] = ty;
+          flt[i * 2].reset();
+          flt[i * 2 + 1].reset();
+          buf[i * 2] = flt[i * 2].filter(tx, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
+          buf[i * 2 + 1] = flt[i * 2 + 1].filter(ty, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
         } else {
-          const dx = tx - buf[i * 2];
-          const dy = ty - buf[i * 2 + 1];
-          const dist = Math.hypot(dx, dy);
-          const rate = 18 + Math.min(1, dist / 32) * 50;
-          const alpha = 1 - Math.exp(-rate * safeDt);
-          buf[i * 2] += dx * alpha;
-          buf[i * 2 + 1] += dy * alpha;
+          buf[i * 2] = flt[i * 2].filter(tx, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
+          buf[i * 2 + 1] = flt[i * 2 + 1].filter(ty, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
         }
       }
 
       this.activeFlags[slot] = true;
+      pose.confidence = 1;
       const palmX = (buf[0] + buf[10] + buf[18] + buf[34]) * 0.25;
       const palmY = (buf[1] + buf[11] + buf[19] + buf[35]) * 0.25;
       const palmScale = Math.hypot(buf[18] - buf[0], buf[19] - buf[1]);
@@ -384,9 +573,17 @@ export class OpticalPrismEngine {
   private vao: WebGLVertexArrayObject;
   private vbo: WebGLBuffer;
   private videoTex: WebGLTexture;
+
+  // 2-Pass Cinema Clean Ping-Pong FBOs for Motion-Adaptive Temporal Denoise
+  private prevTexs: [WebGLTexture, WebGLTexture];
+  private prevFbos: [WebGLFramebuffer, WebGLFramebuffer];
+  private fboReadIdx: 0 | 1 = 0;
+  private fboW = 0;
+  private fboH = 0;
+  private hasPrevFrame = false;
+
   private interpolator = new FullHandInterpolator();
 
-  // Pre-allocated scratch buffers (Zero-GC)
   private reusableHands: HandPose2D[] = [];
   private fullQuadVerts = new Float32Array([
     -1, 1, 0, 0,
@@ -399,67 +596,68 @@ export class OpticalPrismEngine {
   private polyVertScratch = new Float32Array(24 * 4);
 
   // Modular high-detail graphics engines (src/fx/)
-  private galaxyFx = new GalaxyFx();
-  private lightningFx = new LightningFx();
+  private cosmosFx: Cosmos3DEngine | null = null;
   private mysticFx = new MysticFx();
 
-  // Motion Trail ring buffer
   private trailBuffer: TrailFrame[] = [];
-
-  // Air-Canvas strokes
   private airStrokes: AirStroke[] = [];
   private activeStroke: AirStroke | null = null;
-
-  // Flying light streaks from fingertip into centered 3D Hologram Text
   private noteBeams: NoteSparkBeam[] = [];
-  // Motion swoosh wave when swiping horizontally to switch modes
   private swipeSwoosh: SwipeSwoosh | null = null;
-  // Smooth 200ms crossfade easing when entering a new Mode
-  private prevRenderedMode: CycleModeId | null = null;
-  private modeFade = 1;
-  // Smooth Lerp for HD+ Denoise shader uniform (no abrupt sharp/blur snaps)
+  private lastPolyCache: { pts: Point2D[]; color: string }[] = [];
+  private polyDissolves: PolyDissolveGhost[] = [];
+
+  private transitionMgr = new TransitionManager();
   private smoothEnhance = 1;
   private elapsed = 0;
 
   private locs: {
     uVideo: WebGLUniformLocation | null;
+    uPrevFrame: WebGLUniformLocation | null;
     uCoverScale: WebGLUniformLocation | null;
     uVideoTexel: WebGLUniformLocation | null;
     uMirrored: WebGLUniformLocation | null;
     uEnhance: WebGLUniformLocation | null;
+    uHasPrev: WebGLUniformLocation | null;
     uShaderType: WebGLUniformLocation | null;
     uTint: WebGLUniformLocation | null;
   };
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, cosmosCanvas?: HTMLCanvasElement | null) {
+    if (cosmosCanvas) {
+      this.cosmosFx = new Cosmos3DEngine(cosmosCanvas);
+    }
     const gl = canvas.getContext('webgl2', {
       alpha: false,
       antialias: false,
       depth: false,
       powerPreference: 'high-performance',
     });
-    if (!gl) throw new Error('Trình duyệt không hỗ trợ WebGL2.');
+    if (!gl) throw new Error('WebGL2 is not supported by this browser.');
     this.gl = gl;
 
     this.program = linkProgram(gl, VERT_SRC, FRAG_SRC);
     this.locs = {
       uVideo: gl.getUniformLocation(this.program, 'uVideo'),
+      uPrevFrame: gl.getUniformLocation(this.program, 'uPrevFrame'),
       uCoverScale: gl.getUniformLocation(this.program, 'uCoverScale'),
       uVideoTexel: gl.getUniformLocation(this.program, 'uVideoTexel'),
       uMirrored: gl.getUniformLocation(this.program, 'uMirrored'),
       uEnhance: gl.getUniformLocation(this.program, 'uEnhance'),
+      uHasPrev: gl.getUniformLocation(this.program, 'uHasPrev'),
       uShaderType: gl.getUniformLocation(this.program, 'uShaderType'),
       uTint: gl.getUniformLocation(this.program, 'uTint'),
     };
 
     const vao = gl.createVertexArray();
     const vbo = gl.createBuffer();
-    const tex = gl.createTexture();
-    if (!vao || !vbo || !tex) throw new Error('Không thể khởi tạo tài nguyên WebGL2.');
+    if (!vao || !vbo) throw new Error('Không thể khởi tạo tài nguyên WebGL2.');
 
     this.vao = vao;
     this.vbo = vbo;
-    this.videoTex = tex;
+    this.videoTex = this.createLinearTex();
+    this.prevTexs = [this.createLinearTex(), this.createLinearTex()];
+    this.prevFbos = [this.createFbo(this.prevTexs[0]), this.createFbo(this.prevTexs[1])];
 
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
@@ -471,11 +669,7 @@ export class OpticalPrismEngine {
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
 
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
     gl.texImage2D(
       gl.TEXTURE_2D,
       0,
@@ -488,12 +682,64 @@ export class OpticalPrismEngine {
       new Uint8Array([0, 0, 0, 255]),
     );
     gl.bindTexture(gl.TEXTURE_2D, null);
+
+    this.ensureFboSize(canvas.width || 1280, canvas.height || 720);
+  }
+
+  private createLinearTex(): WebGLTexture {
+    const gl = this.gl;
+    const tex = gl.createTexture();
+    if (!tex) throw new Error('Không thể tạo WebGL2 texture.');
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return tex;
+  }
+
+  private createFbo(tex: WebGLTexture): WebGLFramebuffer {
+    const gl = this.gl;
+    const fbo = gl.createFramebuffer();
+    if (!fbo) throw new Error('Không thể tạo WebGL2 framebuffer.');
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return fbo;
+  }
+
+  private ensureFboSize(w: number, h: number): void {
+    const pw = Math.max(1, Math.floor(w));
+    const ph = Math.max(1, Math.floor(h));
+    if (pw === this.fboW && ph === this.fboH) return;
+    this.fboW = pw;
+    this.fboH = ph;
+    this.hasPrevFrame = false;
+
+    const gl = this.gl;
+    for (let i = 0; i < 2; i += 1) {
+      gl.bindTexture(gl.TEXTURE_2D, this.prevTexs[i]);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, pw, ph, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    }
+    gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
   resetSmoothing(): void {
     this.interpolator.reset();
-    this.galaxyFx.reset();
+    this.cosmosFx?.reset();
+    this.cosmosFx?.resetLightning();
+    this.mysticFx.reset();
     this.trailBuffer = [];
+    this.hasPrevFrame = false;
+  }
+
+  isCosmosBlackHoleBusy(): boolean {
+    return this.cosmosFx?.isBlackHoleBusy() ?? false;
+  }
+
+  prewarmCosmosNow(): void {
+    this.cosmosFx?.prewarmAllNow();
   }
 
   clearDrawing(): void {
@@ -501,10 +747,8 @@ export class OpticalPrismEngine {
     this.activeStroke = null;
   }
 
-  /** Spawns a sweeping light ribbon across the viewport in the exact Air Swipe direction. */
   spawnSwipeSwoosh(dir: -1 | 1): void {
-    this.swipeSwoosh = { dir, age: 0, duration: 0.28 };
-    this.modeFade = 0;
+    this.swipeSwoosh = { dir, age: 0, duration: 0.32 };
   }
 
   spawnNoteSpark(
@@ -541,10 +785,10 @@ export class OpticalPrismEngine {
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
 
-  private drawFullscreenWebcamPass(): void {
+  private drawFullQuad(shaderType: number): void {
     const gl = this.gl;
     gl.disable(gl.BLEND);
-    gl.uniform1i(this.locs.uShaderType, 4);
+    gl.uniform1i(this.locs.uShaderType, shaderType);
     gl.uniform4f(this.locs.uTint, 1, 1, 1, 1);
 
     gl.bindVertexArray(this.vao);
@@ -684,6 +928,7 @@ export class OpticalPrismEngine {
     ctx.restore();
   }
 
+  /** Air Swipe 3.0 Visual Feedback: Curved luminous arc + motion streak sweeping across viewport. */
   private drawSwipeSwoosh(
     ctx: CanvasRenderingContext2D,
     viewW: number,
@@ -699,22 +944,145 @@ export class OpticalPrismEngine {
     }
 
     const t = sw.age / sw.duration;
-    const ease = 1 - Math.pow(1 - t, 2.6);
+    const ease = 1 - Math.pow(1 - t, 2.5);
     const alpha = Math.sin(t * Math.PI);
-    const bandW = viewW * 0.26;
+    const bandW = viewW * 0.24;
     const xPos =
       sw.dir === 1 ? -bandW + (viewW + bandW * 2) * ease : viewW + bandW - (viewW + bandW * 2) * ease;
 
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
+
+    // Soft sweeping ambient light wash
     const grad = ctx.createLinearGradient(xPos - bandW * 0.5, 0, xPos + bandW * 0.5, 0);
     grad.addColorStop(0, 'rgba(34, 211, 238, 0)');
-    grad.addColorStop(0.42, `rgba(34, 211, 238, ${alpha * 0.26})`);
-    grad.addColorStop(0.5, `rgba(255, 255, 255, ${alpha * 0.45})`);
-    grad.addColorStop(0.58, `rgba(168, 85, 247, ${alpha * 0.24})`);
+    grad.addColorStop(0.45, `rgba(34, 211, 238, ${alpha * 0.24})`);
+    grad.addColorStop(0.5, `rgba(255, 255, 255, ${alpha * 0.42})`);
+    grad.addColorStop(0.55, `rgba(168, 85, 247, ${alpha * 0.22})`);
     grad.addColorStop(1, 'rgba(168, 85, 247, 0)');
     ctx.fillStyle = grad;
     ctx.fillRect(xPos - bandW * 0.5, 0, bandW, viewH);
+
+    // Crisp curved Swipe Arc Indicator bowing forward in swipe direction
+    const bow = sw.dir * viewW * 0.08;
+    ctx.strokeStyle = `rgba(103, 232, 249, ${alpha * 0.72})`;
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(xPos - bow * 0.4, viewH * 0.14);
+    ctx.quadraticCurveTo(xPos + bow, viewH * 0.5, xPos - bow * 0.4, viewH * 0.86);
+    ctx.stroke();
+
+    ctx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.92})`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  /** Ethereal Prismatic Mist Dissolve when retracting hands in Glass / Thermal / Prism modes. */
+  private drawPolyDissolves(ctx: CanvasRenderingContext2D, dt: number): void {
+    if (this.polyDissolves.length === 0) return;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const alive: PolyDissolveGhost[] = [];
+
+    for (let i = 0; i < this.polyDissolves.length; i += 1) {
+      const g = this.polyDissolves[i];
+      g.age += dt;
+      if (g.age >= g.duration) continue;
+      const t = g.age / g.duration;
+      const alpha = Math.pow(1 - t, 1.7);
+      const expand = 1 + t * 0.16;
+      const liftY = -t * 18;
+
+      // Expanding translucent chromatic silhouette
+      ctx.beginPath();
+      for (let k = 0; k < g.pts.length; k += 1) {
+        const px = g.cx + (g.pts[k].x - g.cx) * expand;
+        const py = g.cy + (g.pts[k].y - g.cy) * expand + liftY;
+        if (k === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = g.color;
+      ctx.lineWidth = 4.5 * (1 - t) + 0.8;
+      ctx.globalAlpha = alpha * 0.55;
+      ctx.stroke();
+
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.2;
+      ctx.globalAlpha = alpha * 0.72;
+      ctx.stroke();
+
+      // Rising shimmering prismatic dust motes
+      for (let m = 0; m < g.motes.length; m += 1) {
+        const pt = g.motes[m];
+        pt.x += pt.vx * dt;
+        pt.y += pt.vy * dt;
+        pt.vy -= 36 * dt;
+        ctx.fillStyle = m % 2 === 0 ? '#e0f2fe' : g.color;
+        ctx.globalAlpha = alpha * 0.85;
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 1.5 + (1 - t) * 1.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      alive.push(g);
+    }
+
+    this.polyDissolves = alive;
+    ctx.restore();
+  }
+  /** Directional Swipe Indicator hugging the swiping hand during Phase 1 (Arm -> Commit). */
+  private drawDirectionalSwipeIndicator(
+    ctx: CanvasRenderingContext2D,
+    ind: SwipeIndicatorState,
+    viewW: number,
+    viewH: number,
+  ): void {
+    if (!ind.active || ind.dir === 0 || ind.progress <= 0.04) return;
+    const cx = ind.normX * viewW;
+    const cy = ind.normY * viewH - 52;
+    const dir = ind.dir;
+    const p = Math.min(1, ind.progress);
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // Subtle directional progress rail
+    const barW = 74;
+    const x0 = cx - barW * 0.5;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(x0, cy);
+    ctx.lineTo(x0 + barW, cy);
+    ctx.stroke();
+
+    const fillStart = dir === 1 ? x0 : x0 + barW;
+    const fillEnd = dir === 1 ? x0 + barW * p : x0 + barW * (1 - p);
+    ctx.strokeStyle = `rgba(56, 189, 248, ${0.55 + p * 0.45})`;
+    ctx.lineWidth = 3.5;
+    ctx.beginPath();
+    ctx.moveTo(fillStart, cy);
+    ctx.lineTo(fillEnd, cy);
+    ctx.stroke();
+
+    // Animated directional chevron pair pointing in swipe direction
+    for (let k = 0; k < 2; k += 1) {
+      const tipX = fillEnd + dir * (10 + k * 9);
+      const a = (0.45 + p * 0.55) * (k === 0 ? 1 : 0.6);
+      ctx.strokeStyle = `rgba(224, 242, 254, ${a})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(tipX - dir * 7, cy - 7);
+      ctx.lineTo(tipX, cy);
+      ctx.lineTo(tipX - dir * 7, cy + 7);
+      ctx.stroke();
+    }
+
     ctx.restore();
   }
 
@@ -729,11 +1097,13 @@ export class OpticalPrismEngine {
     settings: PrismSettings,
     isHoveringUi: boolean,
     overlayCtx: CanvasRenderingContext2D | null,
+    swipeIndicator?: SwipeIndicatorState,
   ): FrameOutput {
     this.elapsed += dt;
-    const gl = this.gl;
-    gl.viewport(0, 0, viewW, viewH);
+    this.ensureFboSize(viewW, viewH);
+    this.cosmosFx?.setLightningSfxEnabled(settings.sfxEnabled);
 
+    const gl = this.gl;
     if (overlayCtx) {
       overlayCtx.clearRect(0, 0, viewW, viewH);
     }
@@ -760,32 +1130,37 @@ export class OpticalPrismEngine {
       : null;
     const isLeadFist = leadHand ? leadHand.gesture === 'FIST' : false;
 
-    // Resolve active mode
-    let activeMode: CycleModeId = 'GLASS';
+    // Resolve target mode
+    let targetMode: CycleModeId = 'GLASS';
     if (settings.mode !== 'AUTO') {
-      activeMode = settings.mode;
+      targetMode = settings.mode;
     } else if (hands.length <= 1) {
-      activeMode = 'GLASS';
+      targetMode = 'GLASS';
     } else {
       const g0 = hands[0].gesture;
       const g1 = hands[1].gesture;
       const pointingOrPinched =
         g0 === 'PINCH' || g0 === 'POINT' || g1 === 'PINCH' || g1 === 'POINT';
-      activeMode = pointingOrPinched ? 'THERMAL' : 'PRISM';
+      targetMode = pointingOrPinched ? 'THERMAL' : 'PRISM';
     }
 
-    // Track smooth 200ms fade-in/easing whenever switching between Modes
-    if (this.prevRenderedMode !== activeMode) {
-      this.prevRenderedMode = activeMode;
-      this.modeFade = 0;
-      if (activeMode === 'GALAXY') this.galaxyFx.reset();
-    } else if (this.modeFade < 1) {
-      this.modeFade = Math.min(1, this.modeFade + dt / 0.22);
+    // Unified 3-Phase Scene Transition Lifecycle (ENTER 280ms -> ACTIVE -> EXIT 220ms)
+    const didSwitch = this.transitionMgr.setMode(targetMode);
+    if (didSwitch) {
+      if (targetMode === 'COSMOS') this.cosmosFx?.reset();
+      if (targetMode === 'MYSTIC') this.mysticFx.reset();
+      if (targetMode === 'LIGHTNING') this.cosmosFx?.resetLightning();
     }
-    const modeEase = 1 - Math.pow(1 - this.modeFade, 2.4);
+    const trans = this.transitionMgr.update(dt);
+    const activeMode = trans.activeMode;
 
     // Air-Canvas drawing
-    if (settings.airDrawEnabled && leadHand && !isHoveringUi && leadHand.pts[17] < viewH - 92) {
+    if (
+      settings.airDrawEnabled &&
+      leadHand &&
+      !isHoveringUi &&
+      leadHand.pts[17] < viewH - 92
+    ) {
       if (leadHand.gesture === 'POINT') {
         const tx = leadHand.pts[16];
         const ty = leadHand.pts[17];
@@ -807,9 +1182,23 @@ export class OpticalPrismEngine {
       this.activeStroke = null;
     }
 
-    const livePolygons = settings.airDrawEnabled ? [] : buildOpticalPolygons(hands, activeMode);
+    // Build incoming + outgoing optical polygons (skipped when Air Draw active)
+    const livePolygons: RenderPolygon[] = [];
+    if (!settings.airDrawEnabled) {
+      if (trans.outgoingMode && trans.outgoingAlpha > 0.02) {
+        const outPolys = buildOpticalPolygons(hands, trans.outgoingMode);
+        for (let i = 0; i < outPolys.length; i += 1) {
+          outPolys[i].tint[3] *= trans.outgoingAlpha;
+          livePolygons.push(outPolys[i]);
+        }
+      }
+      const inPolys = buildOpticalPolygons(hands, activeMode);
+      for (let i = 0; i < inPolys.length; i += 1) {
+        inPolys[i].tint[3] *= trans.activeAlpha;
+        livePolygons.push(inPolys[i]);
+      }
+    }
 
-    // Motion Trail ring buffer
     if (settings.trailEnabled && livePolygons.length > 0) {
       this.trailBuffer.push({
         outlines: livePolygons.map((p) => ({
@@ -826,30 +1215,56 @@ export class OpticalPrismEngine {
       this.trailBuffer.shift();
     }
 
-    // Smoothly Lerp HD+ Denoise shader uniform so transitions never snap harshly
     const targetEnhance = settings.hdDenoise ? 1.0 : 0.0;
     this.smoothEnhance += (targetEnhance - this.smoothEnhance) * (1 - Math.exp(-5.0 * dt));
 
-    // --- WebGL2 Pass 1: ALWAYS draw latest videoTex every rAF frame (never blank frame) ---
+    const writeIdx: 0 | 1 = this.fboReadIdx === 0 ? 1 : 0;
+
+    // --- WebGL2 Pass 1: Cinema Clean (Temporal Denoise + Chroma Smooth + ACES + Vignette) into FBO ---
     gl.useProgram(this.program);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.prevFbos[writeIdx]);
+    gl.viewport(0, 0, this.fboW, this.fboH);
+
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.videoTex);
     gl.uniform1i(this.locs.uVideo, 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.prevTexs[this.fboReadIdx]);
+    gl.uniform1i(this.locs.uPrevFrame, 1);
+
     gl.uniform2f(this.locs.uCoverScale, coverX, coverY);
     gl.uniform2f(this.locs.uVideoTexel, 1.0 / Math.max(videoW, 1), 1.0 / Math.max(videoH, 1));
     gl.uniform1f(this.locs.uMirrored, settings.mirrored ? 1.0 : 0.0);
     gl.uniform1f(this.locs.uEnhance, this.smoothEnhance);
+    gl.uniform1f(this.locs.uHasPrev, this.hasPrevFrame ? 1.0 : 0.0);
 
-    this.drawFullscreenWebcamPass();
+    this.drawFullQuad(4);
 
-    // --- WebGL2 Pass 2: Vivid Glass / Thermal / Prism Shader Polygons ---
+    // --- WebGL2 Pass 2: Blit Cinema Clean FBO + Optical Polygons ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, viewW, viewH);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.prevTexs[writeIdx]);
+    gl.uniform1i(this.locs.uPrevFrame, 1);
+
+    this.drawFullQuad(5);
+
     for (let i = 0; i < livePolygons.length; i += 1) {
       this.drawPolygonWebGL(livePolygons[i], viewW, viewH);
     }
 
+    // Unbind both texture units cleanly (ANGLE D3D11 zero feedback hazard)
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, null);
 
-    // --- Canvas 2D Overlay (Zero-Copy, dpr=1, 0 shadowBlur) ---
+    this.fboReadIdx = writeIdx;
+    this.hasPrevFrame = true;
+
+    // --- Canvas 2D & Shared Three.js WebGL2 + UnrealBloomPass Overlay ---
     if (overlayCtx) {
       if (settings.trailEnabled && this.trailBuffer.length > 1) {
         overlayCtx.save();
@@ -866,34 +1281,112 @@ export class OpticalPrismEngine {
         overlayCtx.restore();
       }
 
-      // Chromatic Aberration Edge Split around Glass / Thermal / Prism polygons
       if (livePolygons.length > 0) {
-        renderPrismChromaticEdges(overlayCtx, livePolygons, modeEase);
-      }
-
-      // Upgraded Modular VFX with smooth 200ms intro easing
-      if (!settings.airDrawEnabled) {
-        if (activeMode === 'GALAXY') {
-          this.galaxyFx.updateAndRender(overlayCtx, hands, dt, this.modeFade);
-        } else if (activeMode === 'LIGHTNING') {
-          this.lightningFx.updateAndRender(overlayCtx, hands, dt, modeEase);
-        } else if (activeMode === 'MYSTIC') {
-          this.mysticFx.updateAndRender(overlayCtx, hands, dt, this.modeFade);
+        this.lastPolyCache = livePolygons.map((p) => ({
+          pts: p.pts.map((v) => ({ x: v.x, y: v.y })),
+          color: p.glow,
+        }));
+      } else if (this.lastPolyCache.length > 0) {
+        // Hand retracted or swiped away -> shatter polygon into ~180 inertial particles over 550ms
+        const perPoly = Math.max(80, Math.floor(190 / this.lastPolyCache.length));
+        for (let i = 0; i < this.lastPolyCache.length; i += 1) {
+          const cached = this.lastPolyCache[i];
+          if (cached.pts.length < 3) continue;
+          let cx = 0;
+          let cy = 0;
+          for (let k = 0; k < cached.pts.length; k += 1) {
+            cx += cached.pts[k].x;
+            cy += cached.pts[k].y;
+          }
+          cx /= cached.pts.length;
+          cy /= cached.pts.length;
+          const motes: { x: number; y: number; vx: number; vy: number }[] = [];
+          for (let m = 0; m < perPoly; m += 1) {
+            const pA = cached.pts[m % cached.pts.length];
+            const pB = cached.pts[(m + 1) % cached.pts.length];
+            const f = Math.random();
+            const mx = pA.x + (pB.x - pA.x) * f;
+            const my = pA.y + (pB.y - pA.y) * f;
+            motes.push({
+              x: mx,
+              y: my,
+              vx: (mx - cx) * 0.55 + (Math.random() - 0.5) * 85,
+              vy: (my - cy) * 0.4 - 42 - Math.random() * 75,
+            });
+          }
+          this.polyDissolves.push({
+            pts: cached.pts,
+            cx,
+            cy,
+            color: cached.color,
+            age: 0,
+            duration: 0.55,
+            motes,
+          });
         }
+        this.lastPolyCache = [];
       }
 
-      // Cybernetic HUD Skeleton
+      if (livePolygons.length > 0) {
+        renderPrismChromaticEdges(
+          overlayCtx,
+          livePolygons,
+          Math.max(trans.activeAlpha, trans.outgoingAlpha),
+        );
+      }
+      this.drawPolyDissolves(overlayCtx, dt);
+
+      if (!settings.airDrawEnabled) {
+        // Shared Three.js Stage renders Cosmos AND/OR 3D Volumetric Lightning in ONE UnrealBloomPass
+        const cosmosActive =
+          activeMode === 'COSMOS' || (trans.outgoingMode === 'COSMOS' && trans.outgoingAlpha > 0.02);
+        const cosmosFade =
+          activeMode === 'COSMOS' ? trans.enterProgress : trans.outgoingAlpha;
+
+        const lightningActive =
+          activeMode === 'LIGHTNING' ||
+          (trans.outgoingMode === 'LIGHTNING' && trans.outgoingAlpha > 0.02);
+        const lightningFade =
+          activeMode === 'LIGHTNING' ? trans.activeAlpha : trans.outgoingAlpha;
+        const lightningEnter = activeMode === 'LIGHTNING' ? trans.enterProgress : 1;
+
+        if (cosmosActive || lightningActive) {
+          this.cosmosFx?.renderStage({
+            cosmosActive,
+            cosmosFade,
+            lightningActive,
+            lightningFade,
+            lightningEnter,
+            hands,
+            dt,
+            viewW,
+            viewH,
+            overlayCtx,
+          });
+        } else {
+          this.cosmosFx?.clear();
+        }
+
+        // Mystic 2D Eldritch Mandala (supports parallel ENTER/EXIT crossfade)
+        if (trans.outgoingMode === 'MYSTIC' && trans.outgoingAlpha > 0.02) {
+          this.mysticFx.updateAndRender(overlayCtx, hands, dt, trans.outgoingAlpha);
+        }
+        if (activeMode === 'MYSTIC') {
+          this.mysticFx.updateAndRender(overlayCtx, hands, dt, trans.enterProgress);
+        }
+      } else {
+        this.cosmosFx?.clear();
+      }
+
       if (settings.cyberHud && hands.length > 0) {
         drawCyberneticHandHud(overlayCtx, hands, activeMode, this.elapsed);
       }
 
-      // Air-Canvas Neon Strokes
       this.drawAirStrokes(overlayCtx);
-
-      // Flying Note Sparks into centered 3D Hologram Text
       this.drawNoteBeams(overlayCtx, dt);
-
-      // Air Swipe Motion Swoosh Wave
+      if (swipeIndicator && swipeIndicator.active) {
+        this.drawDirectionalSwipeIndicator(overlayCtx, swipeIndicator, viewW, viewH);
+      }
       this.drawSwipeSwoosh(overlayCtx, viewW, viewH, dt);
     }
 
@@ -906,10 +1399,14 @@ export class OpticalPrismEngine {
   }
 
   dispose(): void {
+    this.cosmosFx?.dispose();
+    this.cosmosFx = null;
     const gl = this.gl;
     gl.deleteProgram(this.program);
     gl.deleteVertexArray(this.vao);
     gl.deleteBuffer(this.vbo);
     gl.deleteTexture(this.videoTex);
+    this.prevTexs.forEach((t) => gl.deleteTexture(t));
+    this.prevFbos.forEach((f) => gl.deleteFramebuffer(f));
   }
 }
