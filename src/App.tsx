@@ -304,6 +304,19 @@ function getVideoConstraintsForPreset(preset: CameraPresetId): MediaTrackConstra
   }
 }
 
+async function findObsCameraDeviceId(): Promise<string | undefined> {
+  if (!navigator.mediaDevices?.enumerateDevices) return undefined;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const obs = devices.find(
+      (d) => d.kind === 'videoinput' && d.deviceId && /obs/i.test(d.label || ''),
+    );
+    return obs?.deviceId || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function openCameraStream(
   preferredDeviceId?: string,
   preset: CameraPresetId = 'AUTO',
@@ -321,7 +334,9 @@ async function openCameraStream(
   ];
 
   if (preferredDeviceId) {
+    // Allow OBS Virtual Camera to open with its native output profile before falling back to default cam
     attempts.push(
+      { deviceId: { exact: preferredDeviceId } },
       { ...baseVideo, facingMode: 'user' },
       { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, min: 25 }, facingMode: 'user' },
       { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 30, min: 25 }, facingMode: 'user' },
@@ -340,6 +355,27 @@ async function openCameraStream(
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error('Unable to open camera stream.');
+}
+
+/** Defaults to OBS Virtual Camera whenever available (handles both pre-granted and first-time permission). */
+async function openDefaultObsCameraStream(preset: CameraPresetId): Promise<MediaStream> {
+  const preObsId = await findObsCameraDeviceId();
+  const initialStream = await openCameraStream(preObsId, preset);
+  if (preObsId) return initialStream;
+
+  // On first visit labels were empty until permission was granted; re-check for OBS now
+  const postObsId = await findObsCameraDeviceId();
+  const activeId = initialStream.getVideoTracks()[0]?.getSettings?.().deviceId;
+  if (postObsId && postObsId !== activeId) {
+    try {
+      const obsStream = await openCameraStream(postObsId, preset);
+      initialStream.getTracks().forEach((t) => t.stop());
+      return obsStream;
+    } catch {
+      return initialStream;
+    }
+  }
+  return initialStream;
 }
 
 function scheduleSafeFocusLock(
@@ -1063,7 +1099,7 @@ export default function App() {
           };
         } else {
           const [camStream] = await Promise.all([
-            openCameraStream(undefined, savedPreset),
+            openDefaultObsCameraStream(savedPreset),
             trackerClient.init(
               onWorkerResult,
               settingsRef.current.aiEngineMode,
