@@ -5,7 +5,7 @@ import {
   renderPrismChromaticEdges,
   renderTrailOutline,
 } from '../fx/prism';
-import { RippleWaveSim } from '../fx/ripple';
+import { RippleWaveSim, type RippleSimMeta } from '../fx/ripple';
 import { TransitionManager } from '../fx/transitionManager';
 import type { HandPose2D, Point2D, RenderPolygon } from '../fx/types';
 import type {
@@ -23,6 +23,7 @@ export type { Point2D };
 
 interface TrailFrame {
   outlines: { pts: Point2D[]; color: string }[];
+  age: number;
 }
 
 interface AirStroke {
@@ -74,7 +75,7 @@ export const AIR_DRAW_COLORS: Record<AirDrawColorId, { hex: string; label: strin
 const HAND_PERSISTENCE_SEC = 0.18;
 const ONE_EURO_MIN_CUTOFF = 1.2;
 const ONE_EURO_BETA = 0.04;
-const TRAIL_MAX_FRAMES = 14;
+const TRAIL_MAX_AGE_SEC = 0.23; // FPS-invariant motion trail window (identical at 60 & 120 FPS)
 
 const VERT_SRC = `#version 300 es
 precision highp float;
@@ -104,8 +105,12 @@ uniform float uMirrored;
 uniform float uRippleStrength;
 uniform float uRippleBias;
 uniform float uRippleInvScale;
-uniform int uShaderType; // 0=GLASS, 1=THERMAL, 2=PRISM, 4=PASSTHROUGH_RIPPLE
+uniform int uShaderType; // 0=BEVELED_GLASS_LENS, 1=THERMAL, 2=PRISM, 4=PASSTHROUGH_RIPPLE
 uniform vec4 uTint;
+uniform vec2 uLensVerts[4];
+uniform int uLensCount;
+uniform vec2 uLensCenter;
+uniform float uViewAspect;
 
 out vec4 fragColor;
 
@@ -139,32 +144,54 @@ void main() {
   vec2 uv = clamp(screenToVideoUv(vScreenUv), vec2(0.002), vec2(0.998));
 
   if (uShaderType == 4) {
-    // Ultra-light pass-through webcam + Liquid Glass Reality Ripple displacement
+    // Ultra-light pass-through webcam + True 16-bit Float Liquid Glass Reality Ripple
     if (uRippleStrength > 0.002) {
       vec2 rUv = vec2(vScreenUv.x, 1.0 - vScreenUv.y);
-      float hL = sampleWaveHeight(rUv - vec2(uRippleTexel.x, 0.0));
-      float hR = sampleWaveHeight(rUv + vec2(uRippleTexel.x, 0.0));
-      float hU = sampleWaveHeight(rUv - vec2(0.0, uRippleTexel.y));
-      float hD = sampleWaveHeight(rUv + vec2(0.0, uRippleTexel.y));
+      vec2 t = uRippleTexel;
 
-      vec2 grad = vec2(hR - hL, hD - hU);
-      vec2 disp = grad * 0.095 * uRippleStrength;
+      // 9-tap smooth Sobel gradient for silky optical refraction normals
+      float hTL = sampleWaveHeight(rUv + vec2(-t.x, -t.y));
+      float hTC = sampleWaveHeight(rUv + vec2( 0.0, -t.y));
+      float hTR = sampleWaveHeight(rUv + vec2( t.x, -t.y));
+      float hML = sampleWaveHeight(rUv + vec2(-t.x,  0.0));
+      float hC  = sampleWaveHeight(rUv);
+      float hMR = sampleWaveHeight(rUv + vec2( t.x,  0.0));
+      float hBL = sampleWaveHeight(rUv + vec2(-t.x,  t.y));
+      float hBC = sampleWaveHeight(rUv + vec2( 0.0,  t.y));
+      float hBR = sampleWaveHeight(rUv + vec2( t.x,  t.y));
+
+      float gx = (hTR + 2.0 * hMR + hBR) - (hTL + 2.0 * hML + hBL);
+      float gy = (hBL + 2.0 * hBC + hBR) - (hTL + 2.0 * hTC + hTR);
+      vec2 grad = vec2(gx, gy) * 0.25;
+
+      // Smooth deep UV refraction + soft R/G/B Chromatic Aberration along wave slope
+      vec2 disp = grad * 0.105 * uRippleStrength;
       if (uMirrored > 0.5) disp.x = -disp.x;
 
-      // Liquid Glass Chromatic Aberration (R/G/B split along wave slope)
-      float rCh = texture(uVideo, clamp(uv + disp * 1.14, 0.002, 0.998)).r;
+      float rCh = texture(uVideo, clamp(uv + disp * 1.15, 0.002, 0.998)).r;
       float gCh = texture(uVideo, clamp(uv + disp,        0.002, 0.998)).g;
-      float bCh = texture(uVideo, clamp(uv + disp * 0.86, 0.002, 0.998)).b;
+      float bCh = texture(uVideo, clamp(uv + disp * 0.85, 0.002, 0.998)).b;
       vec3 refracted = vec3(rCh, gCh, bCh);
 
-      // Crisp specular highlight on liquid wave crests
-      vec3 N = normalize(vec3(-grad.x * 8.5, -grad.y * 8.5, 1.0));
-      vec3 L = normalize(vec3(-0.35, 0.45, 0.82));
-      vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));
-      float spec = pow(max(dot(N, H), 0.0), 40.0) * 0.62 * uRippleStrength;
-      float rimTint = clamp(length(grad) * 2.2, 0.0, 1.0) * 0.14 * uRippleStrength;
+      // Glossy Fresnel specular highlights + subtle aquatic caustics on convex crests
+      vec3 N = normalize(vec3(-grad.x * 7.5, -grad.y * 7.5, 1.0));
+      vec3 V = vec3(0.0, 0.0, 1.0);
+      vec3 L1 = normalize(vec3(-0.38, 0.48, 0.79));
+      vec3 L2 = normalize(vec3(0.45, -0.35, 0.82));
 
-      fragColor = vec4(clamp(refracted + vec3(0.85, 0.95, 1.0) * spec + vec3(0.35, 0.72, 1.0) * rimTint, 0.0, 1.0), 1.0);
+      float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0) * uRippleStrength;
+      float spec1 = pow(max(dot(N, normalize(L1 + V)), 0.0), 56.0) * 0.72;
+      float spec2 = pow(max(dot(N, normalize(L2 + V)), 0.0), 32.0) * 0.28;
+      float spec = (spec1 + spec2) * uRippleStrength;
+
+      float lap = max(0.0, hC * 4.0 - (hML + hMR + hTC + hBC));
+      float caustics = smoothstep(0.012, 0.14, lap) * 0.24 * uRippleStrength;
+
+      vec3 glassLight =
+        vec3(0.92, 0.97, 1.0) * spec +
+        vec3(0.45, 0.82, 1.0) * (fresnel * 0.34 + caustics);
+
+      fragColor = vec4(clamp(refracted + glassLight, 0.0, 1.0), 1.0);
       return;
     }
 
@@ -172,19 +199,74 @@ void main() {
     return;
   }
 
+  // Mode 0: 3D Beveled Liquid Glass Crystal Lens (Convex center magnification + Beveled edge refraction)
+  if (uShaderType == 0) {
+    vec2 aspect = vec2(uViewAspect, 1.0);
+    vec2 pA = vScreenUv * aspect;
+    vec2 cA = uLensCenter * aspect;
+
+    float minDist = 10.0;
+    vec2 bestInNormal = vec2(0.0, 1.0);
+
+    for (int i = 0; i < 4; i++) {
+      if (i >= uLensCount) break;
+      int nextIdx = (i + 1 == uLensCount) ? 0 : (i + 1);
+      vec2 a = uLensVerts[i] * aspect;
+      vec2 b = uLensVerts[nextIdx] * aspect;
+      vec2 ab = b - a;
+      float lenSq = max(dot(ab, ab), 0.00001);
+      float proj = clamp(dot(pA - a, ab) / lenSq, 0.0, 1.0);
+      vec2 closest = a + ab * proj;
+      float d = length(pA - closest);
+
+      if (d < minDist) {
+        minDist = d;
+        vec2 edgeDir = ab / sqrt(lenSq);
+        vec2 n = vec2(-edgeDir.y, edgeDir.x);
+        // Orient normal inward toward lens center
+        if (dot(cA - closest, n) < 0.0) n = -n;
+        bestInNormal = n;
+      }
+    }
+
+    // Smooth optical bevel ramp along the crystal borders (0 = clear convex dome, 1 = sharp beveled edge)
+    float bevel = 1.0 - smoothstep(0.0, 0.046, minDist);
+    float bevelSq = bevel * bevel;
+
+    // 1. Subtle convex crystal magnification in the clear center
+    vec2 toCenter = vScreenUv - uLensCenter;
+    vec2 convexShift = -toCenter * 0.095 * (1.0 - bevel * 0.5);
+
+    // 2. Strong beveled liquid-glass refraction bending light around the 4 edges
+    vec2 bevelShift = (-bestInNormal / aspect) * bevelSq * 0.046;
+    vec2 totalShift = convexShift + bevelShift;
+    if (uMirrored > 0.5) totalShift.x = -totalShift.x;
+
+    // 3. Prismatic chromatic aberration along the beveled crystal facets
+    vec2 caShift = (-bestInNormal / aspect) * bevelSq * 0.011;
+    if (uMirrored > 0.5) caShift.x = -caShift.x;
+
+    float rCh = texture(uVideo, clamp(uv + totalShift + caShift, 0.002, 0.998)).r;
+    float gCh = texture(uVideo, clamp(uv + totalShift,           0.002, 0.998)).g;
+    float bCh = texture(uVideo, clamp(uv + totalShift - caShift, 0.002, 0.998)).b;
+    vec3 refracted = vec3(rCh, gCh, bCh);
+
+    // 4. 3D bevel surface lighting, top-left specular catchlight & crystal rim sheen
+    vec3 bevelN = normalize(vec3(-bestInNormal * bevel * 1.45, 1.0));
+    vec3 lightDir = normalize(vec3(-0.45, -0.55, 0.70));
+    float spec = pow(max(dot(bevelN, lightDir), 0.0), 34.0) * bevel * 0.46;
+    float rimGlow = smoothstep(0.68, 0.99, bevel) * 0.28;
+    float domeSheen = pow(max(0.0, 1.0 - length((vScreenUv - uLensCenter) * 2.4)), 2.0) * 0.04;
+
+    vec3 crystal = refracted * 1.04 + vec3(0.012, 0.025, 0.042) * (0.35 + bevel * 0.65);
+    crystal += vec3(0.95, 0.98, 1.0) * (spec + rimGlow + domeSheen);
+    fragColor = vec4(clamp(crystal, 0.0, 1.0), 0.98 * uTint.a);
+    return;
+  }
+
   // Optical Polygons read directly from raw mirrored webcam texture
   vec3 cam = texture(uVideo, uv).rgb;
   float luma = lumaOf(cam);
-
-  if (uShaderType == 0) {
-    vec3 col = cam * 1.44;
-    col = (col - 0.5) * 1.34 + 0.5;
-    float gLuma = lumaOf(col);
-    col = mix(vec3(gLuma), col, 1.25);
-    col = clamp(col + vec3(0.04, 0.06, 0.09), 0.0, 1.0);
-    fragColor = vec4(col, 0.96);
-    return;
-  }
 
   if (uShaderType == 1) {
     vec2 t = uVideoTexel * 2.0;
@@ -193,7 +275,7 @@ void main() {
     float edge = clamp((abs(lR - luma) + abs(lU - luma)) * 4.5, 0.0, 1.0);
     float stretched = clamp((luma - 0.08) * 1.48 + edge * 0.22, 0.0, 1.0);
     vec3 thermal = thermalFalseColor(stretched);
-    fragColor = vec4(thermal, 0.98);
+    fragColor = vec4(thermal, 0.98 * uTint.a);
     return;
   }
 
@@ -270,9 +352,13 @@ export function normToScreen(
  */
 class FullHandInterpolator {
   private buffers: [Float32Array, Float32Array] = [new Float32Array(42), new Float32Array(42)];
+  private targetBuffers: [Float32Array, Float32Array] = [new Float32Array(42), new Float32Array(42)];
+  private velBuffers: [Float32Array, Float32Array] = [new Float32Array(42), new Float32Array(42)];
   private filters: [OneEuroAxis[], OneEuroAxis[]];
   private activeFlags: [boolean, boolean] = [false, false];
   private missedSec: [number, number] = [0, 0];
+  private lastPacketSeq = -1;
+  private sincePacketSec = 0;
   private poses: [HandPose2D, HandPose2D];
 
   constructor() {
@@ -309,6 +395,10 @@ class FullHandInterpolator {
     this.activeFlags[1] = false;
     this.missedSec[0] = 0;
     this.missedSec[1] = 0;
+    this.lastPacketSeq = -1;
+    this.sincePacketSec = 0;
+    this.velBuffers[0].fill(0);
+    this.velBuffers[1].fill(0);
     for (let s = 0; s < 2; s += 1) {
       for (let i = 0; i < 42; i += 1) this.filters[s][i].reset();
     }
@@ -341,8 +431,18 @@ class FullHandInterpolator {
     coverY: number,
     mirrored: boolean,
     outHands: HandPose2D[],
+    packetSeq = 0,
   ): void {
     outHands.length = 0;
+    const safeDt = Math.min(Math.max(dt, 0.002), 0.08);
+    const isFreshPacket = packetSeq !== this.lastPacketSeq;
+    const aiDt = Math.min(0.12, Math.max(0.015, this.sincePacketSec > 0 ? this.sincePacketSec : 0.033));
+    if (isFreshPacket) {
+      this.lastPacketSeq = packetSeq;
+      this.sincePacketSec = 0;
+    } else {
+      this.sincePacketSec = Math.min(0.12, this.sincePacketSec + safeDt);
+    }
 
     // Collect valid incoming hands (up to 2)
     const validHands: { hand: Landmark3D[]; gesture: GestureType; px: number; py: number }[] = [];
@@ -408,11 +508,16 @@ class FullHandInterpolator {
       }
     }
 
-    const safeDt = Math.min(Math.max(dt, 0.004), 0.08);
+    // Gentle bounded 120Hz velocity lookahead between 30Hz webcam AI packets (zero overshoot)
+    const predDt = Math.min(this.sincePacketSec, 0.028) * 0.45;
+    const velDecay = this.sincePacketSec > 0.038 ? Math.exp(-12 * safeDt) : 1;
+
     for (let slot = 0; slot < 2; slot += 1) {
       const hand = assignedHand[slot];
       const gesture = assignedGesture[slot];
       const buf = this.buffers[slot];
+      const tgt = this.targetBuffers[slot];
+      const vel = this.velBuffers[slot];
       const flt = this.filters[slot];
       const pose = this.poses[slot];
 
@@ -422,12 +527,13 @@ class FullHandInterpolator {
           this.missedSec[slot] += safeDt;
           const dropFrac = Math.min(1, this.missedSec[slot] / HAND_PERSISTENCE_SEC);
           pose.confidence = Math.max(0.35, 1 - dropFrac * 0.65);
-          pose.palmSpeedMps *= 0.85;
+          pose.palmSpeedMps *= Math.exp(-9.75 * safeDt);
           outHands.push(pose);
         } else {
           this.activeFlags[slot] = false;
           this.missedSec[slot] = 0;
           pose.confidence = 0;
+          vel.fill(0);
           for (let i = 0; i < 42; i += 1) flt[i].reset();
         }
         continue;
@@ -443,15 +549,34 @@ class FullHandInterpolator {
         const rawX = mirrored ? 1 - lm.x : lm.x;
         const tx = ((rawX - 0.5) / coverX + 0.5) * viewW;
         const ty = ((lm.y - 0.5) / coverY + 0.5) * viewH;
+        const ix = i * 2;
+        const iy = ix + 1;
 
         if (!wasActive) {
-          flt[i * 2].reset();
-          flt[i * 2 + 1].reset();
-          buf[i * 2] = flt[i * 2].filter(tx, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
-          buf[i * 2 + 1] = flt[i * 2 + 1].filter(ty, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
+          tgt[ix] = tx;
+          tgt[iy] = ty;
+          vel[ix] = 0;
+          vel[iy] = 0;
+          flt[ix].reset();
+          flt[iy].reset();
+          buf[ix] = flt[ix].filter(tx, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
+          buf[iy] = flt[iy].filter(ty, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
         } else {
-          buf[i * 2] = flt[i * 2].filter(tx, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
-          buf[i * 2 + 1] = flt[i * 2 + 1].filter(ty, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
+          if (isFreshPacket) {
+            const instVx = Math.max(-2200, Math.min(2200, (tx - tgt[ix]) / aiDt));
+            const instVy = Math.max(-2200, Math.min(2200, (ty - tgt[iy]) / aiDt));
+            vel[ix] = vel[ix] * 0.35 + instVx * 0.65;
+            vel[iy] = vel[iy] * 0.35 + instVy * 0.65;
+            tgt[ix] = tx;
+            tgt[iy] = ty;
+          } else if (velDecay < 1) {
+            vel[ix] *= velDecay;
+            vel[iy] *= velDecay;
+          }
+          const predX = tgt[ix] + vel[ix] * predDt;
+          const predY = tgt[iy] + vel[iy] * predDt;
+          buf[ix] = flt[ix].filter(predX, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
+          buf[iy] = flt[iy].filter(predY, safeDt, ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA);
         }
       }
 
@@ -464,7 +589,8 @@ class FullHandInterpolator {
       const movePx = wasActive ? Math.hypot(palmX - prevPalmX, palmY - prevPalmY) : 0;
       const speedPxPerSec = movePx / safeDt;
       const instantMps = Math.min(9.9, speedPxPerSec / Math.max(palmScale * 7.5, 220));
-      pose.palmSpeedMps = pose.palmSpeedMps * 0.75 + instantMps * 0.25;
+      const speedBlend = 1 - Math.exp(-17.3 * safeDt);
+      pose.palmSpeedMps += (instantMps - pose.palmSpeedMps) * speedBlend;
 
       pose.palmX = palmX;
       pose.palmY = palmY;
@@ -472,6 +598,61 @@ class FullHandInterpolator {
       pose.gesture = gesture;
       outHands.push(pose);
     }
+  }
+}
+
+/**
+ * 120Hz Elastic Spring-Physics Smoother for the 3D Beveled Liquid Glass Lens vertices:
+ * Delivers tactile glass inertia & elastic follow when stretching/rotating between 2 hands.
+ */
+class GlassLensSpring {
+  private x = new Float32Array(4);
+  private y = new Float32Array(4);
+  private vx = new Float32Array(4);
+  private vy = new Float32Array(4);
+  private activeCount = 0;
+
+  public reset(): void {
+    this.activeCount = 0;
+    this.vx.fill(0);
+    this.vy.fill(0);
+  }
+
+  public update(targetPts: Point2D[], dt: number): Point2D[] {
+    const n = Math.min(4, targetPts.length);
+    if (n < 3) {
+      this.activeCount = 0;
+      return targetPts;
+    }
+
+    const safeDt = Math.min(Math.max(dt, 0.002), 0.033);
+    if (this.activeCount !== n) {
+      for (let i = 0; i < n; i += 1) {
+        this.x[i] = targetPts[i].x;
+        this.y[i] = targetPts[i].y;
+        this.vx[i] = 0;
+        this.vy[i] = 0;
+      }
+      this.activeCount = n;
+    } else {
+      // Critically-underdamped spring (stiffness=220, damping=22) — pure dt-normalized at 120Hz
+      const stiffness = 220;
+      const damping = 22;
+      for (let i = 0; i < n; i += 1) {
+        const ax = (targetPts[i].x - this.x[i]) * stiffness - this.vx[i] * damping;
+        const ay = (targetPts[i].y - this.y[i]) * stiffness - this.vy[i] * damping;
+        this.vx[i] += ax * safeDt;
+        this.vy[i] += ay * safeDt;
+        this.x[i] += this.vx[i] * safeDt;
+        this.y[i] += this.vy[i] * safeDt;
+      }
+    }
+
+    const out: Point2D[] = [];
+    for (let i = 0; i < n; i += 1) {
+      out.push({ x: this.x[i], y: this.y[i] });
+    }
+    return out;
   }
 }
 
@@ -499,6 +680,8 @@ export class OpticalPrismEngine {
   private cosmosFx: Cosmos3DEngine | null = null;
   private mysticFx = new MysticFx();
   private rippleSim: RippleWaveSim;
+  private glassSpring = new GlassLensSpring();
+  private lensVertScratch = new Float32Array(8);
   private rippleStrength = 0;
 
   private trailBuffer: TrailFrame[] = [];
@@ -524,6 +707,10 @@ export class OpticalPrismEngine {
     uRippleInvScale: WebGLUniformLocation | null;
     uShaderType: WebGLUniformLocation | null;
     uTint: WebGLUniformLocation | null;
+    uLensVerts: WebGLUniformLocation | null;
+    uLensCount: WebGLUniformLocation | null;
+    uLensCenter: WebGLUniformLocation | null;
+    uViewAspect: WebGLUniformLocation | null;
   };
 
   constructor(canvas: HTMLCanvasElement, cosmosCanvas?: HTMLCanvasElement | null) {
@@ -552,6 +739,10 @@ export class OpticalPrismEngine {
       uRippleInvScale: gl.getUniformLocation(this.program, 'uRippleInvScale'),
       uShaderType: gl.getUniformLocation(this.program, 'uShaderType'),
       uTint: gl.getUniformLocation(this.program, 'uTint'),
+      uLensVerts: gl.getUniformLocation(this.program, 'uLensVerts[0]'),
+      uLensCount: gl.getUniformLocation(this.program, 'uLensCount'),
+      uLensCenter: gl.getUniformLocation(this.program, 'uLensCenter'),
+      uViewAspect: gl.getUniformLocation(this.program, 'uViewAspect'),
     };
 
     const vao = gl.createVertexArray();
@@ -608,7 +799,12 @@ export class OpticalPrismEngine {
     this.cosmosFx?.resetFluid();
     this.mysticFx.reset();
     this.rippleSim.clear();
+    this.glassSpring.reset();
     this.trailBuffer = [];
+  }
+
+  getRippleMeta(): RippleSimMeta {
+    return this.rippleSim.getMeta();
   }
 
   isCosmosBlackHoleBusy(): boolean {
@@ -701,6 +897,24 @@ export class OpticalPrismEngine {
 
     gl.uniform1i(this.locs.uShaderType, poly.shaderType);
     gl.uniform4f(this.locs.uTint, poly.tint[0], poly.tint[1], poly.tint[2], poly.tint[3]);
+
+    if (poly.shaderType === 0) {
+      const count = Math.min(4, pts.length);
+      let cx = 0;
+      let cy = 0;
+      for (let i = 0; i < count; i += 1) {
+        const u = pts[i].x / viewW;
+        const v = pts[i].y / viewH;
+        this.lensVertScratch[i * 2] = u;
+        this.lensVertScratch[i * 2 + 1] = v;
+        cx += u;
+        cy += v;
+      }
+      gl.uniform2fv(this.locs.uLensVerts, this.lensVertScratch);
+      gl.uniform1i(this.locs.uLensCount, count);
+      gl.uniform2f(this.locs.uLensCenter, cx / Math.max(count, 1), cy / Math.max(count, 1));
+      gl.uniform1f(this.locs.uViewAspect, viewW / Math.max(viewH, 1));
+    }
 
     gl.enable(gl.BLEND);
     if (poly.additive) {
@@ -975,6 +1189,7 @@ export class OpticalPrismEngine {
     isHoveringUi: boolean,
     overlayCtx: CanvasRenderingContext2D | null,
     swipeIndicator?: SwipeIndicatorState,
+    handPacketSeq = 0,
   ): FrameOutput {
     this.elapsed += dt;
     this.cosmosFx?.setLightningSfxEnabled(settings.sfxEnabled);
@@ -996,6 +1211,7 @@ export class OpticalPrismEngine {
       coverY,
       settings.mirrored,
       this.reusableHands,
+      handPacketSeq,
     );
     const hands = this.reusableHands;
 
@@ -1061,6 +1277,7 @@ export class OpticalPrismEngine {
 
     // Build incoming + outgoing optical polygons (skipped when Air Draw active)
     const livePolygons: RenderPolygon[] = [];
+    let hasGlassLens = false;
     if (!settings.airDrawEnabled) {
       if (trans.outgoingMode && trans.outgoingAlpha > 0.02) {
         const outPolys = buildOpticalPolygons(hands, trans.outgoingMode);
@@ -1071,25 +1288,38 @@ export class OpticalPrismEngine {
       }
       const inPolys = buildOpticalPolygons(hands, activeMode);
       for (let i = 0; i < inPolys.length; i += 1) {
+        if (inPolys[i].shaderType === 0) {
+          // 120Hz Elastic Spring Physics for Beveled Liquid Glass Lens vertices
+          inPolys[i].pts = this.glassSpring.update(inPolys[i].pts, dt);
+          hasGlassLens = true;
+        }
         inPolys[i].tint[3] *= trans.activeAlpha;
         livePolygons.push(inPolys[i]);
       }
     }
+    if (!hasGlassLens) {
+      this.glassSpring.reset();
+    }
 
-    if (settings.trailEnabled && livePolygons.length > 0) {
-      this.trailBuffer.push({
-        outlines: livePolygons.map((p) => ({
-          pts: p.pts.map((v) => ({ x: v.x, y: v.y })),
-          color: p.glow,
-        })),
-      });
-      if (this.trailBuffer.length > TRAIL_MAX_FRAMES) {
-        this.trailBuffer.shift();
+    // Time-based motion trail buffer (identical visual duration at 60Hz and 120Hz)
+    if (!settings.trailEnabled) {
+      this.trailBuffer.length = 0;
+    } else {
+      for (let i = this.trailBuffer.length - 1; i >= 0; i -= 1) {
+        this.trailBuffer[i].age += dt;
+        if (this.trailBuffer[i].age >= TRAIL_MAX_AGE_SEC) {
+          this.trailBuffer.splice(i, 1);
+        }
       }
-    } else if (!settings.trailEnabled) {
-      this.trailBuffer = [];
-    } else if (this.trailBuffer.length > 0) {
-      this.trailBuffer.shift();
+      if (livePolygons.length > 0) {
+        this.trailBuffer.push({
+          outlines: livePolygons.map((p) => ({
+            pts: p.pts.map((v) => ({ x: v.x, y: v.y })),
+            color: p.glow,
+          })),
+          age: 0,
+        });
+      }
     }
 
     // Smooth Reality Ripple wave simulation + 250ms flatten decay when leaving RIPPLE
@@ -1150,9 +1380,9 @@ export class OpticalPrismEngine {
         overlayCtx.globalCompositeOperation = 'lighter';
         const len = this.trailBuffer.length;
         for (let i = 0; i < len - 1; i += 1) {
-          const frac = (i + 1) / len;
-          const alpha = frac * frac * 0.52;
           const frame = this.trailBuffer[i];
+          const lifeRem = Math.max(0, 1 - frame.age / TRAIL_MAX_AGE_SEC);
+          const alpha = lifeRem * lifeRem * 0.52;
           for (let j = 0; j < frame.outlines.length; j += 1) {
             renderTrailOutline(overlayCtx, frame.outlines[j].pts, frame.outlines[j].color, alpha);
           }

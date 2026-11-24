@@ -8,6 +8,7 @@ export default defineConfig({
     format: 'es',
   },
   build: {
+    sourcemap: false,
     rollupOptions: {
       output: {
         manualChunks: {

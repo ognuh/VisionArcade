@@ -1466,7 +1466,7 @@ export class Cosmos3DEngine {
     this.renderer = new THREE.WebGLRenderer({
       canvas,
       alpha: true,
-      antialias: true,
+      antialias: false,
       powerPreference: 'high-performance',
       premultipliedAlpha: true,
     });
@@ -1512,8 +1512,10 @@ export class Cosmos3DEngine {
     this.feedPass.uniforms.tScene.value = this.sceneRT.texture;
     this.composer.addPass(this.feedPass);
 
-    // UnrealBloomPass: threshold 0.55, strength 0.85, radius 0.65
-    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(initW, initH), 0.85, 0.65, 0.55);
+    // Half-resolution UnrealBloomPass for 4x lower fillrate on RTX 3050 45W at 120 FPS
+    const bloomW = Math.max(1, Math.floor(initW / 2));
+    const bloomH = Math.max(1, Math.floor(initH / 2));
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(bloomW, bloomH), 0.85, 0.65, 0.55);
     this.composer.addPass(this.bloomPass);
 
     // Final alpha-preserving ACES tone-mapping output pass
@@ -1667,7 +1669,7 @@ export class Cosmos3DEngine {
     this.renderer.setSize(w, h, false);
     this.sceneRT.setSize(w, h);
     this.composer.setSize(w, h);
-    this.bloomPass.setSize(w, h);
+    this.bloomPass.setSize(Math.max(1, Math.floor(w / 2)), Math.max(1, Math.floor(h / 2)));
   }
 
   clear(): void {

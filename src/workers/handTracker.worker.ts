@@ -1,20 +1,41 @@
 import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
-import type { GpuInfo, GpuTier, Landmark3D } from '../types/vision';
+import type { AiEngineMode, GpuInfo, GpuTier, Landmark3D } from '../types/vision';
 
-const MEDIAPIPE_WASM_ROOT =
-  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
+const ALLOWED_WASM_LOADERS = new Set([
+  '/mediapipe/vision_wasm_module_internal.js',
+  '/mediapipe/vision_wasm_internal.js',
+  '/mediapipe/vision_wasm_nosimd_internal.js',
+]);
+
+// Strictly allowlisted same-origin native ES import() hook for MediaPipe's official ES Module WASM loader.
+// Zero eval() / new Function() -> compatible with strict CSP (script-src 'self' 'wasm-unsafe-eval').
+(self as unknown as { import?: (url: string) => Promise<void> }).import = async (url: string) => {
+  const parsed = new URL(url, self.location.origin);
+  if (parsed.origin !== self.location.origin || !ALLOWED_WASM_LOADERS.has(parsed.pathname)) {
+    throw new Error(`Blocked unauthorized MediaPipe loader URL: ${parsed.pathname}`);
+  }
+  const mod = (await import(/* @vite-ignore */ parsed.href)) as { default?: unknown };
+  const g = self as unknown as { ModuleFactory?: unknown };
+  if (!g.ModuleFactory && mod?.default) {
+    g.ModuleFactory = mod.default;
+  }
+};
+
+const MEDIAPIPE_WASM_ROOT = '/mediapipe';
 
 const HAND_LANDMARKER_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
-const AI_W = 480;
-const AI_H = 270;
-const LUMA_SAMPLE_INTERVAL_MS = 500;
-
-export type LightingStatus = 'NORMAL' | 'LOW_LIGHT_BOOST' | 'HIGHLIGHT_TAME';
+const AI_W = 320;
+const AI_H = 180;
+const WARMUP_FRAMES = 3;
+const BENCHMARK_FRAMES = 25;
+const GPU_MAX_AVG_INFER_MS = 24;
+const GPU_MIN_AI_FPS = 24;
 
 interface InitRequest {
   type: 'INIT';
+  engineMode?: AiEngineMode;
 }
 
 interface DetectRequest {
@@ -23,42 +44,43 @@ interface DetectRequest {
   timestampMs: number;
 }
 
+interface SetEngineRequest {
+  type: 'SET_ENGINE';
+  engineMode: AiEngineMode;
+}
+
 interface CloseRequest {
   type: 'CLOSE';
 }
 
-type WorkerRequest = InitRequest | DetectRequest | CloseRequest;
+type WorkerRequest = InitRequest | DetectRequest | SetEngineRequest | CloseRequest;
 
+type VisionFileset = Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
+
+let visionFileset: VisionFileset | null = null;
 let landmarker: HandLandmarker | null = null;
-let prepCanvas: OffscreenCanvas | null = null;
-let prepCtx: OffscreenCanvasRenderingContext2D | null = null;
-let lastLumaCheckMs = 0;
-let lightingMode: LightingStatus = 'NORMAL';
-let emaLumaValue = 128;
-let lumaInitialized = false;
+let engineMode: AiEngineMode = 'AUTO';
+let activeDelegate: 'GPU' | 'CPU' = 'GPU';
+let isSwitching = false;
+let lastDetectTs = 0;
 
-// Hysteresis thresholds to eliminate rapid toggling in borderline lighting
-const LOW_LIGHT_ON_LUMA = 75;
-const LOW_LIGHT_OFF_LUMA = 100;
-const HIGHLIGHT_ON_LUMA = 188;
-const HIGHLIGHT_OFF_LUMA = 165;
-const LUMA_EMA_ALPHA = 0.25;
+// Auto-Benchmark state (first 25 steady-state frames after 3 cold warmup frames on GPU)
+let benchDone = false;
+let warmupCount = 0;
+let benchCount = 0;
+let benchInferSumMs = 0;
+let benchStartMs = 0;
+let benchInputSpanSumMs = 0;
+let benchPrevInputTs = 0;
 
-// Pre-computed 256-entry LUTs for Zero-GC real-time low-light gamma lift & backlight highlight taming
-const lowLightLut = new Uint8ClampedArray(256);
-const highlightLut = new Uint8ClampedArray(256);
-
-for (let i = 0; i < 256; i += 1) {
-  const n = i / 255;
-  // Low-light: Gamma Lift (gamma ~0.55) + Contrast 1.35
-  const gammaLifted = Math.pow(n, 0.55);
-  const lowC = (gammaLifted - 0.5) * 1.35 + 0.52;
-  lowLightLut[i] = Math.max(0, Math.min(255, Math.round(lowC * 255)));
-
-  // Backlight / Overexposed: Lower highlights + boost midtone separation
-  const tamed = Math.pow(n, 1.32);
-  const hiC = (tamed - 0.5) * 1.18 + 0.48;
-  highlightLut[i] = Math.max(0, Math.min(255, Math.round(hiC * 255)));
+function resetBenchmark(): void {
+  benchDone = false;
+  warmupCount = 0;
+  benchCount = 0;
+  benchInferSumMs = 0;
+  benchStartMs = 0;
+  benchInputSpanSumMs = 0;
+  benchPrevInputTs = 0;
 }
 
 function classifyGpuTier(renderer: string): GpuTier {
@@ -79,7 +101,12 @@ function classifyGpuTier(renderer: string): GpuTier {
   ) {
     return 'DISCRETE';
   }
-  if (lower.includes('intel') || lower.includes('uhd') || lower.includes('iris') || lower.includes('apple m')) {
+  if (
+    lower.includes('intel') ||
+    lower.includes('uhd') ||
+    lower.includes('iris') ||
+    lower.includes('apple m')
+  ) {
     return 'INTEGRATED';
   }
   return 'UNKNOWN';
@@ -108,119 +135,111 @@ function detectWorkerGpu(): { renderer: string; tier: GpuTier } {
   }
 }
 
-/** Adaptive Auto-Exposure & Contrast Boost on 480x270 OffscreenCanvas strictly for AI input. */
-function preprocessForAi(bitmap: ImageBitmap, nowMs: number): OffscreenCanvas {
-  if (!prepCanvas || !prepCtx) {
-    prepCanvas = new OffscreenCanvas(AI_W, AI_H);
-    prepCtx = prepCanvas.getContext('2d', { willReadFrequently: true });
-  }
-  const ctx = prepCtx!;
-  ctx.drawImage(bitmap, 0, 0, AI_W, AI_H);
-
-  const shouldMeasure = nowMs - lastLumaCheckMs >= LUMA_SAMPLE_INTERVAL_MS;
-  const needsLut = lightingMode !== 'NORMAL';
-
-  if (shouldMeasure || needsLut) {
-    const img = ctx.getImageData(0, 0, AI_W, AI_H);
-    const data = img.data;
-
-    if (shouldMeasure) {
-      lastLumaCheckMs = nowMs;
-      let sum = 0;
-      let count = 0;
-      // Fast stride-8 pixel luminance scan (< 0.1ms)
-      for (let i = 0; i < data.length; i += 32) {
-        sum += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
-        count += 1;
-      }
-      const frameLuma = count > 0 ? sum / count : 128;
-      if (!lumaInitialized) {
-        emaLumaValue = frameLuma;
-        lumaInitialized = true;
-      } else {
-        emaLumaValue = emaLumaValue * (1 - LUMA_EMA_ALPHA) + frameLuma * LUMA_EMA_ALPHA;
-      }
-
-      // Schmitt-trigger hysteresis: ON < 75, OFF > 100 (prevents flickering)
-      if (lightingMode === 'LOW_LIGHT_BOOST') {
-        if (emaLumaValue > LOW_LIGHT_OFF_LUMA) {
-          lightingMode = emaLumaValue > HIGHLIGHT_ON_LUMA ? 'HIGHLIGHT_TAME' : 'NORMAL';
-        }
-      } else if (lightingMode === 'HIGHLIGHT_TAME') {
-        if (emaLumaValue < HIGHLIGHT_OFF_LUMA) {
-          lightingMode = emaLumaValue < LOW_LIGHT_ON_LUMA ? 'LOW_LIGHT_BOOST' : 'NORMAL';
-        }
-      } else {
-        if (emaLumaValue < LOW_LIGHT_ON_LUMA) {
-          lightingMode = 'LOW_LIGHT_BOOST';
-        } else if (emaLumaValue > HIGHLIGHT_ON_LUMA) {
-          lightingMode = 'HIGHLIGHT_TAME';
-        }
-      }
-    }
-
-    if (lightingMode !== 'NORMAL') {
-      const lut = lightingMode === 'LOW_LIGHT_BOOST' ? lowLightLut : highlightLut;
-      for (let i = 0; i < data.length; i += 4) {
-        data[i] = lut[data[i]];
-        data[i + 1] = lut[data[i + 1]];
-        data[i + 2] = lut[data[i + 2]];
-      }
-      ctx.putImageData(img, 0, 0);
-    }
+async function createLandmarkerForDelegate(
+  vision: VisionFileset,
+  delegate: 'GPU' | 'CPU',
+): Promise<HandLandmarker> {
+  if (delegate === 'GPU') {
+    // WebGL context host strictly for MediaPipe's internal GPU delegate (zero 2D drawImage/getImageData)
+    const glHost = new OffscreenCanvas(AI_W, AI_H);
+    return HandLandmarker.createFromOptions(vision, {
+      canvas: glHost as unknown as HTMLCanvasElement,
+      baseOptions: {
+        modelAssetPath: HAND_LANDMARKER_MODEL_URL,
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      numHands: 2,
+      minHandDetectionConfidence: 0.35,
+      minHandPresenceConfidence: 0.35,
+      minTrackingConfidence: 0.4,
+    });
   }
 
-  return prepCanvas;
+  return HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: HAND_LANDMARKER_MODEL_URL,
+      delegate: 'CPU',
+    },
+    runningMode: 'VIDEO',
+    numHands: 2,
+    minHandDetectionConfidence: 0.35,
+    minHandPresenceConfidence: 0.35,
+    minTrackingConfidence: 0.4,
+  });
 }
 
-async function initTracker(): Promise<void> {
+async function hotSwitchDelegate(target: 'GPU' | 'CPU', reason: string, avgInferMs = 0): Promise<void> {
+  if (isSwitching || !visionFileset) return;
+  if (landmarker && activeDelegate === target) return;
+
+  isSwitching = true;
   try {
-    const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_ROOT);
-    const gpu = detectWorkerGpu();
+    const old = landmarker;
+    landmarker = null;
+    old?.close();
 
     try {
-      const gpuCanvas = new OffscreenCanvas(AI_W, AI_H);
-      landmarker = await HandLandmarker.createFromOptions(vision, {
-        canvas: gpuCanvas as unknown as HTMLCanvasElement,
-        baseOptions: {
-          modelAssetPath: HAND_LANDMARKER_MODEL_URL,
-          delegate: 'GPU',
-        },
-        runningMode: 'VIDEO',
-        numHands: 2,
-        minHandDetectionConfidence: 0.35,
-        minHandPresenceConfidence: 0.35,
-        minTrackingConfidence: 0.4,
-      });
-
-      const gpuInfo: GpuInfo = {
-        delegate: 'GPU',
-        renderer: `${gpu.renderer} (Worker)`,
-        tier: gpu.tier,
-      };
-      self.postMessage({ type: 'READY', gpuInfo });
-      return;
+      landmarker = await createLandmarkerForDelegate(visionFileset, target);
+      activeDelegate = target;
     } catch {
-      // Fallback to CPU WASM inside worker (still completely off main thread!)
-      landmarker = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: HAND_LANDMARKER_MODEL_URL,
-          delegate: 'CPU',
-        },
-        runningMode: 'VIDEO',
-        numHands: 2,
-        minHandDetectionConfidence: 0.35,
-        minHandPresenceConfidence: 0.35,
-        minTrackingConfidence: 0.4,
-      });
-
-      const gpuInfo: GpuInfo = {
-        delegate: 'CPU',
-        renderer: 'Worker WASM',
-        tier: 'SOFTWARE',
-      };
-      self.postMessage({ type: 'READY', gpuInfo });
+      // If GPU fails on switch, recover cleanly on CPU WASM SIMD
+      landmarker = await createLandmarkerForDelegate(visionFileset, 'CPU');
+      activeDelegate = 'CPU';
     }
+
+    self.postMessage({
+      type: 'DELEGATE_CHANGED',
+      delegate: activeDelegate,
+      reason,
+      avgInferMs: Math.round(avgInferMs * 10) / 10,
+    });
+  } finally {
+    isSwitching = false;
+  }
+}
+
+async function initTracker(initialMode: AiEngineMode): Promise<void> {
+  engineMode = initialMode;
+  resetBenchmark();
+
+  try {
+    const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_ROOT);
+    // Use MediaPipe's official ES Module WASM loader in ES Module Workers (sets globalThis.ModuleFactory natively, zero eval)
+    if (vision.wasmLoaderPath.endsWith('/vision_wasm_internal.js')) {
+      vision.wasmLoaderPath = `${MEDIAPIPE_WASM_ROOT}/vision_wasm_module_internal.js`;
+      vision.wasmBinaryPath = `${MEDIAPIPE_WASM_ROOT}/vision_wasm_module_internal.wasm`;
+    }
+    visionFileset = vision;
+    const gpu = detectWorkerGpu();
+
+    const wantDelegate: 'GPU' | 'CPU' = initialMode === 'CPU' ? 'CPU' : 'GPU';
+
+    if (wantDelegate === 'GPU') {
+      try {
+        landmarker = await createLandmarkerForDelegate(vision, 'GPU');
+        activeDelegate = 'GPU';
+        const gpuInfo: GpuInfo = {
+          delegate: 'GPU',
+          renderer: `${gpu.renderer} (Worker)`,
+          tier: gpu.tier,
+        };
+        self.postMessage({ type: 'READY', gpuInfo, delegate: activeDelegate });
+        return;
+      } catch {
+        // Fallback directly to CPU WASM SIMD inside worker
+      }
+    }
+
+    landmarker = await createLandmarkerForDelegate(vision, 'CPU');
+    activeDelegate = 'CPU';
+    benchDone = true;
+    const gpuInfo: GpuInfo = {
+      delegate: 'CPU',
+      renderer: 'Worker WASM SIMD',
+      tier: 'SOFTWARE',
+    };
+    self.postMessage({ type: 'READY', gpuInfo, delegate: activeDelegate });
   } catch (err) {
     self.postMessage({
       type: 'ERROR',
@@ -229,67 +248,119 @@ async function initTracker(): Promise<void> {
   }
 }
 
-let lastDetectTs = 0;
+function sanitizeEngineMode(mode: unknown): AiEngineMode {
+  return mode === 'GPU' || mode === 'CPU' || mode === 'AUTO' ? mode : 'AUTO';
+}
 
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   const msg = e.data;
+  if (!msg || typeof msg !== 'object') return;
+
   if (msg.type === 'INIT') {
-    void initTracker();
+    void initTracker(sanitizeEngineMode(msg.engineMode));
+    return;
+  }
+
+  if (msg.type === 'SET_ENGINE') {
+    engineMode = sanitizeEngineMode(msg.engineMode);
+    resetBenchmark();
+    if (engineMode === 'CPU') {
+      benchDone = true;
+      void hotSwitchDelegate('CPU', 'manual');
+    } else if (engineMode === 'GPU') {
+      benchDone = true;
+      void hotSwitchDelegate('GPU', 'manual');
+    } else {
+      // AUTO: start fresh benchmark on GPU
+      void hotSwitchDelegate('GPU', 'auto-rebenchmark');
+    }
     return;
   }
 
   if (msg.type === 'CLOSE') {
     landmarker?.close();
     landmarker = null;
+    visionFileset = null;
     return;
   }
 
   if (msg.type === 'DETECT') {
     const bitmap = msg.bitmap;
+    if (!(bitmap instanceof ImageBitmap)) return;
     try {
-      if (!landmarker) {
-        bitmap.close();
+      if (!landmarker || isSwitching) {
         self.postMessage({
           type: 'RESULT',
           landmarks: [] as Landmark3D[][],
-          lighting: lightingMode,
-          avgLuma: Math.round(emaLumaValue),
+          inferMs: 0,
+          delegate: activeDelegate,
           timestampMs: msg.timestampMs,
         });
         return;
       }
 
-      const processed = preprocessForAi(bitmap, msg.timestampMs);
-      bitmap.close();
-
       const ts = Math.max(lastDetectTs + 1, Math.round(msg.timestampMs));
       lastDetectTs = ts;
 
-      const result = landmarker.detectForVideo(
-        processed as unknown as HTMLCanvasElement,
-        ts,
-      );
+      // Direct Zero-Copy ImageBitmap -> MediaPipe detectForVideo (zero OffscreenCanvas/getImageData)
+      const t0 = performance.now();
+      const result = landmarker.detectForVideo(bitmap as unknown as HTMLCanvasElement, ts);
+      const inferMs = performance.now() - t0;
+
+      // Auto-Benchmark over 25 steady-state GPU frames (skipping first 3 cold shader-compile warmup frames)
+      if (engineMode === 'AUTO' && !benchDone && activeDelegate === 'GPU') {
+        if (warmupCount < WARMUP_FRAMES) {
+          warmupCount += 1;
+        } else {
+          const now = performance.now();
+          if (benchCount === 0) {
+            benchStartMs = now;
+          }
+          if (benchPrevInputTs > 0) {
+            benchInputSpanSumMs += Math.max(0, msg.timestampMs - benchPrevInputTs);
+          }
+          benchPrevInputTs = msg.timestampMs;
+          benchCount += 1;
+          benchInferSumMs += inferMs;
+
+          if (benchCount >= BENCHMARK_FRAMES) {
+            benchDone = true;
+            const avgInferMs = benchInferSumMs / benchCount;
+            const elapsedSec = Math.max(0.05, (now - benchStartMs) / 1000);
+            const actualAiFps = benchCount / elapsedSec;
+            const avgInputCadenceMs =
+              benchCount > 1 ? benchInputSpanSumMs / (benchCount - 1) : 33.3;
+            const webcamFeeding30 = avgInputCadenceMs <= 45;
+
+            if (avgInferMs > GPU_MAX_AVG_INFER_MS || (webcamFeeding30 && actualAiFps < GPU_MIN_AI_FPS)) {
+              void hotSwitchDelegate('CPU', 'auto-benchmark', avgInferMs);
+            }
+          }
+        }
+      }
 
       self.postMessage({
         type: 'RESULT',
         landmarks: (result.landmarks ?? []) as Landmark3D[][],
-        lighting: lightingMode,
-        avgLuma: Math.round(emaLumaValue),
+        inferMs,
+        delegate: activeDelegate,
         timestampMs: msg.timestampMs,
       });
     } catch {
+      self.postMessage({
+        type: 'RESULT',
+        landmarks: [] as Landmark3D[][],
+        inferMs: 0,
+        delegate: activeDelegate,
+        timestampMs: msg.timestampMs,
+      });
+    } finally {
+      // Strictly guarantee zero ImageBitmap VRAM leaks on every single exit path
       try {
         bitmap.close();
       } catch {
         // already closed
       }
-      self.postMessage({
-        type: 'RESULT',
-        landmarks: [] as Landmark3D[][],
-        lighting: lightingMode,
-        avgLuma: Math.round(emaLumaValue),
-        timestampMs: msg.timestampMs,
-      });
     }
   }
 };

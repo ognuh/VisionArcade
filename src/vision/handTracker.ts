@@ -1,8 +1,7 @@
 import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 import type { GpuInfo, GpuTier } from '../types/vision';
 
-const MEDIAPIPE_WASM_ROOT =
-  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm';
+const MEDIAPIPE_WASM_ROOT = '/mediapipe';
 
 const HAND_LANDMARKER_MODEL_URL =
   'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';

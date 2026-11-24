@@ -246,6 +246,28 @@ export function renderPrismChromaticEdges(
     const pts = poly.pts;
     if (pts.length < 3) continue;
 
+    // Mode GLASS (shaderType === 0): crisp crystalline bevel hairline + subtle optical dispersion
+    if (poly.shaderType === 0) {
+      tracePolyOffset(ctx, pts, -1.2, -0.7);
+      ctx.strokeStyle = 'rgba(103, 232, 249, 0.52)';
+      ctx.lineWidth = 1.1;
+      ctx.globalAlpha = 0.72 * fadeAlpha;
+      ctx.stroke();
+
+      tracePolyOffset(ctx, pts, 1.2, 0.7);
+      ctx.strokeStyle = 'rgba(244, 114, 182, 0.45)';
+      ctx.lineWidth = 1.1;
+      ctx.globalAlpha = 0.65 * fadeAlpha;
+      ctx.stroke();
+
+      tracePolyOffset(ctx, pts, 0, 0);
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.25;
+      ctx.globalAlpha = 0.92 * fadeAlpha;
+      ctx.stroke();
+      continue;
+    }
+
     tracePolyOffset(ctx, pts, 0, 0);
     ctx.strokeStyle = poly.glow;
     ctx.lineWidth = 9;

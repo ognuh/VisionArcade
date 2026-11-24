@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { AIR_DRAW_COLORS } from '../prism/prismEngine';
 import type {
+  AiEngineMode,
   AirDrawColorId,
   CameraDeviceItem,
   CameraPresetId,
@@ -29,12 +30,12 @@ interface PrismBarProps {
   cameras: CameraDeviceItem[];
   selectedCameraId: string;
   cameraPreset: CameraPresetId;
+  activeAiDelegate: 'GPU' | 'CPU';
   onSelectCamera: (deviceId: string) => void;
   onSelectCameraPreset: (preset: CameraPresetId) => void;
   fpsTextRef: RefObject<HTMLSpanElement | null>;
   aiFpsTextRef: RefObject<HTMLSpanElement | null>;
   modeTextRef: RefObject<HTMLSpanElement | null>;
-  lowLightDotRef: RefObject<HTMLSpanElement | null>;
   uiRootRef: RefObject<HTMLDivElement | null>;
   dockNavRef: RefObject<HTMLElement | null>;
   toolsOpen: boolean;
@@ -61,6 +62,12 @@ const CAMERA_PRESETS: { id: CameraPresetId; label: string }[] = [
   { id: 'AUTO', label: 'Auto' },
   { id: '720P', label: '720p' },
   { id: '1080P', label: '1080p' },
+];
+
+const AI_ENGINE_MODES: { id: AiEngineMode; label: string }[] = [
+  { id: 'AUTO', label: 'Auto' },
+  { id: 'GPU', label: 'GPU' },
+  { id: 'CPU', label: 'CPU' },
 ];
 
 const DRAW_COLOR_KEYS: AirDrawColorId[] = ['CYAN', 'MAGENTA', 'GREEN', 'GOLD'];
@@ -104,12 +111,12 @@ export function PrismBar({
   cameras,
   selectedCameraId,
   cameraPreset,
+  activeAiDelegate,
   onSelectCamera,
   onSelectCameraPreset,
   fpsTextRef,
   aiFpsTextRef,
   modeTextRef,
-  lowLightDotRef,
   uiRootRef,
   dockNavRef,
   toolsOpen,
@@ -219,7 +226,7 @@ export function PrismBar({
               className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.75)]"
             />
             <span>
-              <span ref={fpsTextRef}>60</span> FPS
+              <span ref={fpsTextRef}>120</span> FPS
             </span>
           </span>
           <span className="text-white/25" aria-hidden="true">
@@ -237,13 +244,6 @@ export function PrismBar({
           >
             {settings.airDrawEnabled ? 'AIR DRAW' : settings.mode}
           </span>
-          <span
-            ref={lowLightDotRef}
-            title="Low-Light Boost Active"
-            aria-label="Low-Light Boost Active"
-            style={{ display: 'none' }}
-            className="ml-0.5 h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.75)]"
-          />
         </div>
       </header>
 
@@ -337,7 +337,43 @@ export function PrismBar({
               </div>
             </section>
 
-            {/* Section 2: Studio Controls */}
+            {/* Section 2: AI Engine Delegate Selector */}
+            <section className="flex flex-col gap-2 border-b border-white/8 pb-3">
+              <div className="flex items-center justify-between">
+                <h2 className="text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
+                  AI Engine
+                </h2>
+                <span className="font-mono text-[10px] text-white/40">{activeAiDelegate}</span>
+              </div>
+
+              <div
+                role="group"
+                aria-label="AI Engine Delegate"
+                className="grid grid-cols-3 gap-0.5 rounded-lg border border-white/8 bg-white/[0.05] p-0.5"
+              >
+                {AI_ENGINE_MODES.map((eng) => {
+                  const active = settings.aiEngineMode === eng.id;
+                  return (
+                    <button
+                      key={eng.id}
+                      type="button"
+                      data-air-clickable="true"
+                      aria-pressed={active}
+                      onClick={() => onSettingsChange({ aiEngineMode: eng.id })}
+                      className={`inline-flex h-6 items-center justify-center rounded-md text-[11px] font-medium transition-colors duration-200 ${
+                        active
+                          ? 'bg-white text-black shadow-xs'
+                          : 'text-white/60 hover:text-white'
+                      }`}
+                    >
+                      {eng.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
+            {/* Section 3: Studio Controls */}
             <section className="flex flex-col gap-1">
               <h2 className="mb-1 text-[10px] font-medium tracking-[0.14em] text-white/45 uppercase">
                 Studio Controls

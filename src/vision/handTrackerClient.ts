@@ -1,45 +1,50 @@
 import type { HandLandmarker } from '@mediapipe/tasks-vision';
-import type { GpuInfo, Landmark3D } from '../types/vision';
-import type { LightingStatus } from '../workers/handTracker.worker';
+import type { AiEngineMode, GpuInfo, Landmark3D } from '../types/vision';
 import { createHandTracker } from './handTracker';
-
-export type { LightingStatus };
 
 export interface TrackingResultPacket {
   landmarks: Landmark3D[][];
-  lighting: LightingStatus;
-  avgLuma: number;
   aiFps: number;
+  inferMs: number;
+  delegate: 'GPU' | 'CPU';
 }
 
-const AI_W = 480;
-const AI_H = 270;
-const LUMA_CHECK_MS = 500;
+const AI_W = 320;
+const AI_H = 180;
+const FPS_WINDOW_SIZE = 20;
 
 /**
- * Multi-Threaded HandTracker Client:
- * - Primary path: Runs MediaPipe HandLandmarker + Auto-Exposure preprocessor inside a dedicated
- *   Web Worker using transferable ImageBitmap (zero-copy, zero main-thread blocking, isProcessing backpressure).
- * - Automatic fallback: If Worker/OffscreenCanvas fails, seamlessly falls back to Main Thread
- *   with time-sliced 320x180 adaptive exposure preprocessing.
+ * Direct Zero-Copy HandTracker Client (320x180 Hardware Resize + Latest-Frame 1-Slot Queue):
+ * - Captures hardware-scaled 320x180 ImageBitmap on main thread and transfers zero-copy to Worker.
+ * - Latest-Frame Slot prevents the 30 -> 15 FPS halving when Worker is briefly busy: keeps only
+ *   the newest ImageBitmap (closing superseded ones immediately -> 0 leaks) and fires it the
+ *   instant the Worker returns a result.
+ * - Supports Auto-Benchmark Delegate (GPU -> CPU WASM SIMD fallback when GPU queue saturates at 120 FPS)
+ *   plus manual AUTO / GPU / CPU override.
  */
 export class HandTrackerClient {
   private worker: Worker | null = null;
   private fallbackLandmarker: HandLandmarker | null = null;
   private fallbackCanvas: HTMLCanvasElement | null = null;
   private fallbackCtx: CanvasRenderingContext2D | null = null;
-  private lowLightLut = new Uint8ClampedArray(256);
-  private highlightLut = new Uint8ClampedArray(256);
 
   private isProcessing = false;
+  private isCapturing = false;
   private disposed = false;
-  private lastResultMs = 0;
-  private emaAiDt = 1 / 30;
+
+  // Latest-Frame Slot (depth 1): holds at most one newest waiting ImageBitmap
+  private pendingBitmap: ImageBitmap | null = null;
+  private pendingTs = 0;
+
+  private engineMode: AiEngineMode = 'AUTO';
+  private activeDelegate: 'GPU' | 'CPU' = 'GPU';
+  private avgInferMs = 0;
   private lastDetectTs = 0;
-  private lastLumaMs = 0;
-  private lighting: LightingStatus = 'NORMAL';
-  private emaLuma = 128;
-  private lumaInit = false;
+
+  // Dedicated Worker completion timestamp ring buffer for accurate AI FPS readout
+  private completionTimes = new Float64Array(FPS_WINDOW_SIZE);
+  private completionCursor = 0;
+  private completionCount = 0;
 
   public gpuInfo: GpuInfo = {
     delegate: 'GPU',
@@ -48,19 +53,16 @@ export class HandTrackerClient {
   };
 
   private onResultCallback: ((packet: TrackingResultPacket) => void) | null = null;
+  private onDelegateChangeCallback: ((delegate: 'GPU' | 'CPU') => void) | null = null;
 
-  constructor() {
-    for (let i = 0; i < 256; i += 1) {
-      const n = i / 255;
-      const lowC = (Math.pow(n, 0.55) - 0.5) * 1.35 + 0.52;
-      this.lowLightLut[i] = Math.max(0, Math.min(255, Math.round(lowC * 255)));
-      const hiC = (Math.pow(n, 1.32) - 0.5) * 1.18 + 0.48;
-      this.highlightLut[i] = Math.max(0, Math.min(255, Math.round(hiC * 255)));
-    }
-  }
-
-  async init(onResult: (packet: TrackingResultPacket) => void): Promise<GpuInfo> {
+  async init(
+    onResult: (packet: TrackingResultPacket) => void,
+    initialEngineMode: AiEngineMode = 'AUTO',
+    onDelegateChange?: (delegate: 'GPU' | 'CPU') => void,
+  ): Promise<GpuInfo> {
     this.onResultCallback = onResult;
+    this.onDelegateChangeCallback = onDelegateChange ?? null;
+    this.engineMode = initialEngineMode;
 
     const canUseWorker =
       typeof Worker !== 'undefined' &&
@@ -69,7 +71,7 @@ export class HandTrackerClient {
 
     if (canUseWorker) {
       try {
-        const gpuInfo = await this.initWorker();
+        const gpuInfo = await this.initWorker(initialEngineMode);
         this.gpuInfo = gpuInfo;
         return gpuInfo;
       } catch (err) {
@@ -79,7 +81,7 @@ export class HandTrackerClient {
       }
     }
 
-    // Automatic Main-Thread fallback with time-slicing & adaptive exposure preprocessing
+    // Automatic Main-Thread fallback
     const tracker = await createHandTracker(false);
     if (this.disposed) {
       tracker.landmarker.close();
@@ -89,12 +91,99 @@ export class HandTrackerClient {
     this.fallbackCanvas = document.createElement('canvas');
     this.fallbackCanvas.width = AI_W;
     this.fallbackCanvas.height = AI_H;
-    this.fallbackCtx = this.fallbackCanvas.getContext('2d', { willReadFrequently: true });
+    this.fallbackCtx = this.fallbackCanvas.getContext('2d');
     this.gpuInfo = tracker.gpuInfo;
+    this.activeDelegate = tracker.gpuInfo.delegate;
+    this.onDelegateChangeCallback?.(this.activeDelegate);
     return tracker.gpuInfo;
   }
 
-  private initWorker(): Promise<GpuInfo> {
+  public setEngineMode(mode: AiEngineMode): void {
+    if (this.engineMode === mode) return;
+    this.engineMode = mode;
+    if (this.worker && !this.disposed) {
+      this.worker.postMessage({ type: 'SET_ENGINE', engineMode: mode });
+    }
+  }
+
+  public getTelemetry(): {
+    isWorker: boolean;
+    delegate: 'GPU' | 'CPU';
+    avgInferMs: number;
+    aiFps: number;
+  } {
+    return {
+      isWorker: this.worker !== null,
+      delegate: this.activeDelegate,
+      avgInferMs: Math.round(this.avgInferMs * 10) / 10,
+      aiFps: this.computeAiFps(),
+    };
+  }
+
+  private recordCompletion(nowMs: number, inferMs: number): number {
+    this.completionTimes[this.completionCursor] = nowMs;
+    this.completionCursor = (this.completionCursor + 1) % FPS_WINDOW_SIZE;
+    if (this.completionCount < FPS_WINDOW_SIZE) {
+      this.completionCount += 1;
+    }
+    if (inferMs > 0) {
+      this.avgInferMs = this.avgInferMs > 0 ? this.avgInferMs * 0.85 + inferMs * 0.15 : inferMs;
+    }
+    return this.computeAiFps();
+  }
+
+  private computeAiFps(): number {
+    if (this.completionCount < 2) return 30;
+    const newestIdx = (this.completionCursor - 1 + FPS_WINDOW_SIZE) % FPS_WINDOW_SIZE;
+    const oldestIdx =
+      this.completionCount < FPS_WINDOW_SIZE ? 0 : this.completionCursor;
+    const spanMs = this.completionTimes[newestIdx] - this.completionTimes[oldestIdx];
+    if (spanMs <= 1) return 30;
+    return Math.min(60, Math.round(((this.completionCount - 1) * 1000) / spanMs));
+  }
+
+  private dispatchToWorker(bitmap: ImageBitmap, timestampMs: number): void {
+    if (this.disposed || !this.worker) {
+      try {
+        bitmap.close();
+      } catch {
+        // ignore
+      }
+      this.isProcessing = false;
+      return;
+    }
+    this.isProcessing = true;
+    this.worker.postMessage({ type: 'DETECT', bitmap, timestampMs }, [bitmap]);
+  }
+
+  private flushPendingToWorker(): void {
+    if (this.disposed || !this.worker) {
+      this.clearPendingBitmap();
+      this.isProcessing = false;
+      return;
+    }
+    if (this.pendingBitmap) {
+      const nextBmp = this.pendingBitmap;
+      const nextTs = this.pendingTs;
+      this.pendingBitmap = null;
+      this.dispatchToWorker(nextBmp, nextTs);
+    } else {
+      this.isProcessing = false;
+    }
+  }
+
+  private clearPendingBitmap(): void {
+    if (this.pendingBitmap) {
+      try {
+        this.pendingBitmap.close();
+      } catch {
+        // ignore
+      }
+      this.pendingBitmap = null;
+    }
+  }
+
+  private initWorker(initialMode: AiEngineMode): Promise<GpuInfo> {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL('../workers/handTracker.worker.ts', import.meta.url), {
         type: 'module',
@@ -103,7 +192,7 @@ export class HandTrackerClient {
 
       const timeoutId = window.setTimeout(() => {
         reject(new Error('Worker MediaPipe init timed out'));
-      }, 12000);
+      }, 15000);
 
       worker.onerror = (ev) => {
         window.clearTimeout(timeoutId);
@@ -114,7 +203,14 @@ export class HandTrackerClient {
         const msg = e.data;
         if (msg.type === 'READY') {
           window.clearTimeout(timeoutId);
+          this.activeDelegate = (msg.delegate ?? msg.gpuInfo?.delegate ?? 'GPU') as 'GPU' | 'CPU';
+          this.onDelegateChangeCallback?.(this.activeDelegate);
           resolve(msg.gpuInfo as GpuInfo);
+          return;
+        }
+        if (msg.type === 'DELEGATE_CHANGED') {
+          this.activeDelegate = (msg.delegate ?? 'CPU') as 'GPU' | 'CPU';
+          this.onDelegateChangeCallback?.(this.activeDelegate);
           return;
         }
         if (msg.type === 'ERROR') {
@@ -123,55 +219,81 @@ export class HandTrackerClient {
           return;
         }
         if (msg.type === 'RESULT') {
-          this.isProcessing = false;
-          if (this.disposed) return;
+          if (this.disposed) {
+            this.clearPendingBitmap();
+            this.isProcessing = false;
+            return;
+          }
 
           const now = performance.now();
-          if (this.lastResultMs > 0) {
-            const dtSec = Math.max(0.005, Math.min(0.25, (now - this.lastResultMs) / 1000));
-            this.emaAiDt = this.emaAiDt * 0.85 + dtSec * 0.15;
-          }
-          this.lastResultMs = now;
+          const inferMs = Number(msg.inferMs ?? 0);
+          const delegate = (msg.delegate ?? this.activeDelegate) as 'GPU' | 'CPU';
+          this.activeDelegate = delegate;
+          const aiFps = this.recordCompletion(now, inferMs);
 
-          this.lighting = msg.lighting as LightingStatus;
-          this.emaLuma = Number(msg.avgLuma ?? 128);
+          // Immediately fire the newest queued frame BEFORE invoking main-thread callbacks
+          // so Worker stays saturated at full 30 FPS cadence without half-stepping!
+          this.flushPendingToWorker();
 
           this.onResultCallback?.({
             landmarks: (msg.landmarks ?? []) as Landmark3D[][],
-            lighting: this.lighting,
-            avgLuma: Math.round(this.emaLuma),
-            aiFps: Math.round(1 / Math.max(this.emaAiDt, 0.01)),
+            aiFps,
+            inferMs,
+            delegate,
           });
         }
       };
 
-      worker.postMessage({ type: 'INIT' });
+      worker.postMessage({ type: 'INIT', engineMode: initialMode });
     });
   }
 
-  /** Submits a new webcam frame only if the tracker is idle (isProcessing === false). */
+  /**
+   * Extracts a hardware-resized 320x180 ImageBitmap and either dispatches immediately
+   * or replaces the single Latest-Frame Slot (closing any older waiting ImageBitmap).
+   */
   submitFrame(video: HTMLVideoElement, timestampMs: number): void {
-    if (this.disposed || this.isProcessing || video.readyState < 2) return;
+    if (this.disposed || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
+      return;
+    }
 
     if (this.worker) {
-      this.isProcessing = true;
-      createImageBitmap(video)
+      if (this.isCapturing) return;
+      this.isCapturing = true;
+
+      createImageBitmap(video, {
+        resizeWidth: AI_W,
+        resizeHeight: AI_H,
+        resizeQuality: 'low',
+      })
         .then((bitmap) => {
+          this.isCapturing = false;
           if (this.disposed || !this.worker) {
-            bitmap.close();
-            this.isProcessing = false;
+            try {
+              bitmap.close();
+            } catch {
+              // ignore
+            }
             return;
           }
-          this.worker.postMessage({ type: 'DETECT', bitmap, timestampMs }, [bitmap]);
+
+          if (!this.isProcessing) {
+            this.dispatchToWorker(bitmap, timestampMs);
+          } else {
+            // Latest-Frame Slot: close stale waiting bitmap, keep only the newest frame
+            this.clearPendingBitmap();
+            this.pendingBitmap = bitmap;
+            this.pendingTs = timestampMs;
+          }
         })
         .catch(() => {
-          this.isProcessing = false;
+          this.isCapturing = false;
         });
       return;
     }
 
-    // Time-sliced main-thread fallback
-    if (this.fallbackLandmarker && this.fallbackCanvas && this.fallbackCtx) {
+    // Main-thread fallback
+    if (this.fallbackLandmarker && this.fallbackCanvas && this.fallbackCtx && !this.isProcessing) {
       this.isProcessing = true;
       window.setTimeout(() => {
         if (this.disposed || !this.fallbackLandmarker || !this.fallbackCanvas || !this.fallbackCtx) {
@@ -181,67 +303,18 @@ export class HandTrackerClient {
         try {
           this.fallbackCtx.drawImage(video, 0, 0, AI_W, AI_H);
           const now = performance.now();
-          const shouldMeasure = now - this.lastLumaMs >= LUMA_CHECK_MS;
-          if (shouldMeasure || this.lighting !== 'NORMAL') {
-            const img = this.fallbackCtx.getImageData(0, 0, AI_W, AI_H);
-            const data = img.data;
-            if (shouldMeasure) {
-              this.lastLumaMs = now;
-              let sum = 0;
-              let count = 0;
-              for (let i = 0; i < data.length; i += 32) {
-                sum += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
-                count += 1;
-              }
-              const frameLuma = count > 0 ? sum / count : 128;
-              if (!this.lumaInit) {
-                this.emaLuma = frameLuma;
-                this.lumaInit = true;
-              } else {
-                this.emaLuma = this.emaLuma * 0.75 + frameLuma * 0.25;
-              }
-
-              // Schmitt-trigger hysteresis: ON < 75, OFF > 100
-              if (this.lighting === 'LOW_LIGHT_BOOST') {
-                if (this.emaLuma > 100) {
-                  this.lighting = this.emaLuma > 188 ? 'HIGHLIGHT_TAME' : 'NORMAL';
-                }
-              } else if (this.lighting === 'HIGHLIGHT_TAME') {
-                if (this.emaLuma < 165) {
-                  this.lighting = this.emaLuma < 75 ? 'LOW_LIGHT_BOOST' : 'NORMAL';
-                }
-              } else if (this.emaLuma < 75) {
-                this.lighting = 'LOW_LIGHT_BOOST';
-              } else if (this.emaLuma > 188) {
-                this.lighting = 'HIGHLIGHT_TAME';
-              }
-            }
-            if (this.lighting !== 'NORMAL') {
-              const lut = this.lighting === 'LOW_LIGHT_BOOST' ? this.lowLightLut : this.highlightLut;
-              for (let i = 0; i < data.length; i += 4) {
-                data[i] = lut[data[i]];
-                data[i + 1] = lut[data[i + 1]];
-                data[i + 2] = lut[data[i + 2]];
-              }
-              this.fallbackCtx.putImageData(img, 0, 0);
-            }
-          }
-
           const ts = Math.max(this.lastDetectTs + 1, Math.round(now));
           this.lastDetectTs = ts;
+          const t0 = performance.now();
           const result = this.fallbackLandmarker.detectForVideo(this.fallbackCanvas, ts);
-
-          if (this.lastResultMs > 0) {
-            const dtSec = Math.max(0.005, Math.min(0.25, (now - this.lastResultMs) / 1000));
-            this.emaAiDt = this.emaAiDt * 0.85 + dtSec * 0.15;
-          }
-          this.lastResultMs = now;
+          const inferMs = performance.now() - t0;
+          const aiFps = this.recordCompletion(now, inferMs);
 
           this.onResultCallback?.({
             landmarks: (result.landmarks ?? []) as Landmark3D[][],
-            lighting: this.lighting,
-            avgLuma: Math.round(this.emaLuma),
-            aiFps: Math.round(1 / Math.max(this.emaAiDt, 0.01)),
+            aiFps,
+            inferMs,
+            delegate: this.activeDelegate,
           });
         } finally {
           this.isProcessing = false;
@@ -253,6 +326,8 @@ export class HandTrackerClient {
   dispose(): void {
     this.disposed = true;
     this.onResultCallback = null;
+    this.onDelegateChangeCallback = null;
+    this.clearPendingBitmap();
     if (this.worker) {
       try {
         this.worker.postMessage({ type: 'CLOSE' });

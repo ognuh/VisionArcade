@@ -23,6 +23,7 @@ export class MysticFx {
   private sSize = new Float32Array(EMBER_POOL_SIZE);
   private cursor = 0;
   private elapsed = 0;
+  private emberSpawnAcc = 0;
   private drawInTime = 0;
   private hadHands = false;
   // Ethereal unwind dissolve state when hands retract (550ms reverse spin + 180 inertial ember shower)
@@ -362,21 +363,35 @@ export class MysticFx {
 
       ctx.restore();
 
-      // Spawn swirling tangential embers while live
+      // Spawn swirling tangential embers at fixed 180/sec rate (FPS-invariant at 60/120Hz)
       if (!isUnwinding && pOuter > 0.2) {
-        const cosR = Math.cos(roll);
-        const sinR = Math.sin(roll);
-        for (let s = 0; s < 3; s += 1) {
-          const a = Math.random() * Math.PI * 2 * pOuter;
-          const lx = Math.cos(a) * baseR * scaleX;
-          const ly = Math.sin(a) * baseR * scaleY;
-          const wx = cx + lx * cosR - ly * sinR;
-          const wy = cy + lx * sinR + ly * cosR;
+        if (hIdx === 0) {
+          this.emberSpawnAcc = Math.min(6, this.emberSpawnAcc + dt * 180);
+        }
+        const toSpawn = Math.floor(this.emberSpawnAcc);
+        if (hIdx === shieldsToDraw.length - 1 && toSpawn > 0) {
+          this.emberSpawnAcc -= toSpawn;
+        }
+        if (toSpawn > 0) {
+          const cosR = Math.cos(roll);
+          const sinR = Math.sin(roll);
+          for (let s = 0; s < toSpawn; s += 1) {
+            const a = Math.random() * Math.PI * 2 * pOuter;
+            const lx = Math.cos(a) * baseR * scaleX;
+            const ly = Math.sin(a) * baseR * scaleY;
+            const wx = cx + lx * cosR - ly * sinR;
+            const wy = cy + lx * sinR + ly * cosR;
 
-          const tvx = -Math.sin(a) * scaleX;
-          const tvy = Math.cos(a) * scaleY;
-          const spd = 125 + Math.random() * 235;
-          this.spawnEmber(wx, wy, (tvx * cosR - tvy * sinR) * spd, (tvx * sinR + tvy * cosR) * spd);
+            const tvx = -Math.sin(a) * scaleX;
+            const tvy = Math.cos(a) * scaleY;
+            const spd = 125 + Math.random() * 235;
+            this.spawnEmber(
+              wx,
+              wy,
+              (tvx * cosR - tvy * sinR) * spd,
+              (tvx * sinR + tvy * cosR) * spd,
+            );
+          }
         }
       }
     }

@@ -319,6 +319,7 @@ export class FluidParticleSandbox {
     const speedBuf = this.speedBuf;
     const t = this.elapsed;
     const drag = Math.exp(-2.15 * safeDt);
+    const coreDamp = Math.exp(-4.35 * safeDt);
     const maxW = this.halfW * 1.02;
     const maxH = this.halfH * 1.02;
 
@@ -362,10 +363,10 @@ export class FluidParticleSandbox {
             const swirl = 28.0 * fall;
             pvx += (-nx * pull - ny * swirl) * safeDt;
             pvy += (-ny * pull + nx * swirl) * safeDt;
-            // Core velocity tether prevents singularity ejection
+            // Core velocity tether prevents singularity ejection (dt-normalized for 120Hz)
             if (dist < 0.35) {
-              pvx *= 0.93;
-              pvy *= 0.93;
+              pvx *= coreDamp;
+              pvy *= coreDamp;
             }
           }
         } else if (m0 === 4) {
@@ -418,8 +419,8 @@ export class FluidParticleSandbox {
             pvx += (-nx * pull + ny * swirl) * safeDt;
             pvy += (-ny * pull - nx * swirl) * safeDt;
             if (dist < 0.35) {
-              pvx *= 0.93;
-              pvy *= 0.93;
+              pvx *= coreDamp;
+              pvy *= coreDamp;
             }
           }
         } else if (m1 === 4) {

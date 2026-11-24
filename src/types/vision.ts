@@ -15,6 +15,8 @@ export interface GpuInfo {
   fallbackReason?: string;
 }
 
+export type AiEngineMode = 'AUTO' | 'GPU' | 'CPU';
+
 export type PrismModeId =
   | 'AUTO'
   | 'GLASS'
@@ -57,4 +59,5 @@ export interface PrismSettings {
   cyberHud: boolean;
   noteOpen: boolean;
   sfxEnabled: boolean;
+  aiEngineMode: AiEngineMode;
 }

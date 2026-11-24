@@ -242,6 +242,7 @@ export class Lightning3DEngine {
   private burstWorldY = 0;
   private edgeFlashAlpha = 0;
   private elapsed = 0;
+  private sparkSpawnAcc = 0;
   private lastPalms: { wx: number; wy: number; vx: number; vy: number }[] = [];
   private prevPalmWorld: { wx: number; wy: number }[] = [];
   private hadHands = false;
@@ -675,8 +676,12 @@ export class Lightning3DEngine {
       this.updateOrb(0, wL.x, wL.y, 0.85 * Math.min(1.25, density), 0.25, conf);
       this.updateOrb(1, wR.x, wR.y, 0.85 * Math.min(1.25, density), 0.25, conf);
 
-      this.spawnSpark3D(wL.x, wL.y, density * 0.95);
-      this.spawnSpark3D(wR.x, wR.y, density * 0.95);
+      this.sparkSpawnAcc += dt * 60;
+      if (this.sparkSpawnAcc >= 1) {
+        this.sparkSpawnAcc -= Math.floor(this.sparkSpawnAcc);
+        this.spawnSpark3D(wL.x, wL.y, density * 0.95);
+        this.spawnSpark3D(wR.x, wR.y, density * 0.95);
+      }
 
       const midX = (wL.x + wR.x) * 0.5;
       const midY = (wL.y + wR.y) * 0.5;
@@ -751,7 +756,11 @@ export class Lightning3DEngine {
           );
           this.emitRibbon(this.ptX, this.ptY, 0.056, conf, false);
         }
-        if (Math.random() < 0.7) this.spawnSpark3D(wP.x, wP.y, 0.85 + this.chargeLevel * 0.75);
+        this.sparkSpawnAcc += dt * 42;
+        if (this.sparkSpawnAcc >= 1) {
+          this.sparkSpawnAcc -= Math.floor(this.sparkSpawnAcc);
+          this.spawnSpark3D(wP.x, wP.y, 0.85 + this.chargeLevel * 0.75);
+        }
       } else {
         if (this.wasFist && this.chargeLevel >= 0.2) {
           // Explosive Thunder Burst!
@@ -769,7 +778,11 @@ export class Lightning3DEngine {
         audioIntensity = 0.45;
 
         this.updateOrb(0, wP.x, wP.y, 0.78, 0.05, conf);
-        this.spawnSpark3D(wP.x, wP.y, 0.85);
+        this.sparkSpawnAcc += dt * 60;
+        if (this.sparkSpawnAcc >= 1) {
+          this.sparkSpawnAcc -= Math.floor(this.sparkSpawnAcc);
+          this.spawnSpark3D(wP.x, wP.y, 0.85);
+        }
 
         for (let t = 0; t < FINGERTIP_IDS.length; t += 1) {
           const idx = FINGERTIP_IDS[t];

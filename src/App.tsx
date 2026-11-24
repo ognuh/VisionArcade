@@ -6,6 +6,7 @@ import { PrismBar } from './components/PrismBar';
 import { OpticalPrismEngine } from './prism/prismEngine';
 import {
   MODE_CYCLE_ORDER,
+  type AiEngineMode,
   type CameraDeviceItem,
   type CameraPresetId,
   type CycleModeId,
@@ -16,7 +17,7 @@ import {
 import { classifyHandGesture, GestureStabilizer } from './vision/gesture';
 import { GestureManager, type SwipeIndicatorState } from './vision/gestureManager';
 import { HandBlinkDetector } from './vision/handBlink';
-import { HandTrackerClient, type LightingStatus } from './vision/handTrackerClient';
+import { HandTrackerClient } from './vision/handTrackerClient';
 import {
   createMockCameraStream,
   generateMockHands,
@@ -37,6 +38,23 @@ interface VisionTestBridge {
     avgRenderMs: number;
     samples: number;
   };
+  getRippleMeta: () => {
+    isHalfFloat: boolean;
+    fboComplete: boolean;
+    simWidth: number;
+    simHeight: number;
+  } | null;
+  runLiveWorkerTest: (
+    engineMode?: AiEngineMode,
+    frames?: number,
+  ) => Promise<{
+    isWorker: boolean;
+    completedFrames: number;
+    steadyAvgInferMs: number;
+    steadyMaxInferMs: number;
+    aiFps: number;
+    delegate: 'GPU' | 'CPU';
+  }>;
   getHoveredUiItem: () => string | null;
   getState: () => {
     mode: PrismSettings['mode'];
@@ -70,6 +88,7 @@ interface CachedButtonRect {
 
 const CAMERA_PRESET_STORAGE_KEY = 'visionarcade.cameraPreset';
 const SFX_STORAGE_KEY = 'visionarcade.sfxEnabled';
+const AI_ENGINE_STORAGE_KEY = 'visionarcade.aiEngineMode';
 const LEGACY_STORAGE_KEYS = [
   'visionarcade.arcadeHighScore',
   'visionarcade.faceMaskMode',
@@ -83,9 +102,9 @@ const DOCK_AUTO_FADE_MS = 2500;
 const MAGNETIC_HIT_PADDING_PX = 14;
 const MAGNETIC_PULL = 0.38;
 const FPS_UPDATE_INTERVAL_MS = 500;
-const EMA_ALPHA = 2 / 31;
+const EMA_ALPHA = 2 / 61;
 const MODE_TOAST_MS = 1000;
-const LOCKED_FPS_INTERVAL_MS = 1000 / 60;
+const TARGET_FPS_INTERVAL_MS = 1000 / 120; // 8.333ms hardware-paced 120 FPS target
 
 const TARGET_HOLO_PHRASE = 'xin chào tôi là hưng';
 const FIST_CLEAR_HOLD_SEC = 1.5;
@@ -149,6 +168,24 @@ function saveSfxEnabled(enabled: boolean): void {
   }
 }
 
+function loadSavedAiEngineMode(): AiEngineMode {
+  try {
+    const v = window.localStorage.getItem(AI_ENGINE_STORAGE_KEY);
+    if (v === 'AUTO' || v === 'GPU' || v === 'CPU') return v;
+  } catch {
+    // ignore storage errors
+  }
+  return 'AUTO';
+}
+
+function saveAiEngineMode(mode: AiEngineMode): void {
+  try {
+    window.localStorage.setItem(AI_ENGINE_STORAGE_KEY, mode);
+  } catch {
+    // ignore storage errors
+  }
+}
+
 function createInitialSettings(): PrismSettings {
   return {
     mode: 'AUTO',
@@ -159,6 +196,7 @@ function createInitialSettings(): PrismSettings {
     cyberHud: true,
     noteOpen: false,
     sfxEnabled: loadSavedSfxEnabled(),
+    aiEngineMode: loadSavedAiEngineMode(),
   };
 }
 
@@ -178,37 +216,55 @@ interface ExtendedTrackSettings extends MediaTrackSettings {
 function getVideoConstraintsForPreset(preset: CameraPresetId): MediaTrackConstraints {
   switch (preset) {
     case '720P':
-      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { min: 25, ideal: 30 } };
     case '1080P':
-      return { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+      return { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { min: 25, ideal: 30 } };
     case 'AUTO':
     default:
-      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+      return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { min: 25, ideal: 30 } };
   }
 }
 
-/** Safely opens webcam (or OBS Virtual Camera) with flexible user-selected resolution. */
+/**
+ * Safely opens webcam with guaranteed 25–30 FPS pacing (prevents Windows Media Foundation
+ * from selecting 1280x720 @ 10fps low-light profile; falls back cleanly to 640x360 @ 30fps on OverconstrainedError).
+ */
 async function openCameraStream(
   preferredDeviceId?: string,
   preset: CameraPresetId = 'AUTO',
 ): Promise<MediaStream> {
   const baseVideo = getVideoConstraintsForPreset(preset);
+  const deviceFilter: MediaTrackConstraints = preferredDeviceId
+    ? { deviceId: { exact: preferredDeviceId } }
+    : { facingMode: 'user' };
 
+  const attempts: MediaTrackConstraints[] = [
+    { ...baseVideo, ...deviceFilter },
+    { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { min: 25, ideal: 30 }, ...deviceFilter },
+    { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 30 }, ...deviceFilter },
+  ];
+
+  // If a saved deviceId was disconnected, add generic default-camera fallback at the end
   if (preferredDeviceId) {
-    try {
-      return await navigator.mediaDevices.getUserMedia({
-        video: { ...baseVideo, deviceId: { exact: preferredDeviceId } },
-        audio: false,
-      });
-    } catch {
-      // Saved camera disconnected or rejected preset; fall through to default camera
-    }
+    attempts.push(
+      { ...baseVideo, facingMode: 'user' },
+      { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { min: 25, ideal: 30 }, facingMode: 'user' },
+      { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 30 }, facingMode: 'user' },
+    );
   }
 
-  return navigator.mediaDevices.getUserMedia({
-    video: { ...baseVideo, facingMode: 'user' },
-    audio: false,
-  });
+  let lastErr: unknown;
+  for (let i = 0; i < attempts.length; i += 1) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        video: attempts[i],
+        audio: false,
+      });
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('Unable to open camera stream.');
 }
 
 /** Safely locks Auto-Focus after 1.5s settle (no-op on virtual cameras with zero errors). */
@@ -264,6 +320,7 @@ export default function App() {
   const [cameras, setCameras] = useState<CameraDeviceItem[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState<string>('');
   const [cameraPreset, setCameraPreset] = useState<CameraPresetId>(loadSavedCameraPreset);
+  const [activeAiDelegate, setActiveAiDelegate] = useState<'GPU' | 'CPU'>('GPU');
   const [retryToken, setRetryToken] = useState(0);
 
   // Centered 3D Extruded Hologram Text state
@@ -278,7 +335,6 @@ export default function App() {
   const fpsTextRef = useRef<HTMLSpanElement | null>(null);
   const aiFpsTextRef = useRef<HTMLSpanElement | null>(null);
   const modeTextRef = useRef<HTMLSpanElement | null>(null);
-  const lowLightDotRef = useRef<HTMLSpanElement | null>(null);
   const uiRootRef = useRef<HTMLDivElement | null>(null);
   const dockNavRef = useRef<HTMLElement | null>(null);
   const airCursorRef = useRef<AirCursorHandle | null>(null);
@@ -506,6 +562,10 @@ export default function App() {
         if (patch.sfxEnabled !== undefined && patch.sfxEnabled !== prev.sfxEnabled) {
           saveSfxEnabled(patch.sfxEnabled);
         }
+        if (patch.aiEngineMode !== undefined && patch.aiEngineMode !== prev.aiEngineMode) {
+          saveAiEngineMode(patch.aiEngineMode);
+          trackerClientRef.current?.setEngineMode(patch.aiEngineMode);
+        }
         if (patch.mode && patch.mode !== 'AUTO' && patch.mode !== prev.mode) {
           showModeToast(patch.mode);
         }
@@ -610,8 +670,31 @@ export default function App() {
     let hoveredBtn: HTMLButtonElement | null = null;
 
     const searchParams = new URLSearchParams(window.location.search);
-    const isTestMode = searchParams.get('test') === '1';
-    const initialTestPose = (searchParams.get('pose') as MockPoseId | null) ?? 'QUAD_TWO_HANDS';
+    const host = window.location.hostname;
+    const isLocalHost = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+    const isTestMode = isLocalHost && searchParams.get('test') === '1';
+    const VALID_MOCK_POSES: ReadonlySet<string> = new Set<MockPoseId>([
+      'NONE',
+      'ONE_FINGER',
+      'TWO_FINGERS',
+      'OPEN_ONE',
+      'FIST_ONE',
+      'OPEN_TWO_HANDS',
+      'QUAD_TWO_HANDS',
+      'AIR_SWIPE_RIGHT',
+      'AIR_SWIPE_LEFT',
+      'AIR_SWIPE_RETURN',
+      'DOCK_HOVER_CENTER',
+      'RIPPLE_WAVE_BURST',
+      'FLUID_INTERACT',
+      'HAND_BLINK',
+      'FIST_BOTH',
+    ]);
+    const requestedPose = searchParams.get('pose');
+    const initialTestPose: MockPoseId =
+      requestedPose && VALID_MOCK_POSES.has(requestedPose)
+        ? (requestedPose as MockPoseId)
+        : 'QUAD_TWO_HANDS';
     if (isTestMode) {
       mockPoseRef.current = initialTestPose;
       mockPoseStartRef.current = performance.now();
@@ -631,12 +714,6 @@ export default function App() {
       hoveredUiItemRef.current = null;
     };
 
-    const updateLightingDom = (status: LightingStatus) => {
-      const dot = lowLightDotRef.current;
-      if (!dot) return;
-      dot.style.display = status === 'LOW_LIGHT_BOOST' ? 'inline-block' : 'none';
-    };
-
     async function boot() {
       try {
         if (!navigator.mediaDevices?.getUserMedia) {
@@ -647,7 +724,7 @@ export default function App() {
 
         let latestHands: Landmark3D[][] = [];
         let latestGestures: GestureType[] = ['IDLE', 'IDLE'];
-        let lastLighting: LightingStatus | null = null;
+        let handPacketSeq = 0;
         let lastAiFpsUpdateMs = 0;
 
         trackerClient = new HandTrackerClient();
@@ -655,13 +732,14 @@ export default function App() {
 
         const onWorkerResult = (packet: {
           landmarks: Landmark3D[][];
-          lighting: LightingStatus;
-          avgLuma: number;
           aiFps: number;
+          inferMs: number;
+          delegate: 'GPU' | 'CPU';
         }) => {
           if (cancelled) return;
           const now = performance.now();
           latestHands = packet.landmarks;
+          handPacketSeq += 1;
 
           const stab0 = stabilizersRef.current[0];
           const stab1 = stabilizersRef.current[1];
@@ -675,11 +753,6 @@ export default function App() {
               aiFpsTextRef.current.textContent = String(packet.aiFps).padStart(2, '0');
             }
             lastAiFpsUpdateMs = now;
-          }
-
-          if (packet.lighting !== lastLighting) {
-            lastLighting = packet.lighting;
-            updateLightingDom(packet.lighting);
           }
 
           const curSettings = settingsRef.current;
@@ -774,6 +847,71 @@ export default function App() {
                 perfSamples > 0 ? Math.round((perfRenderSumMs / perfSamples) * 100) / 100 : 0,
               samples: perfSamples,
             }),
+            getRippleMeta: () => engineRef.current?.getRippleMeta() ?? null,
+            runLiveWorkerTest: async (
+              testEngineMode: AiEngineMode = 'AUTO',
+              targetFrames = 30,
+            ) => {
+              const vid = videoRef.current;
+              if (!vid) throw new Error('Video element missing');
+              const benchClient = new HandTrackerClient();
+              let count = 0;
+              let steadyCount = 0;
+              let steadySumMs = 0;
+              let steadyMaxMs = 0;
+              let lastFps = 0;
+              let lastDelegate: 'GPU' | 'CPU' = 'GPU';
+              let timerId = 0;
+
+              return new Promise((resolve, reject) => {
+                const finish = () => {
+                  window.clearTimeout(timeoutId);
+                  window.clearInterval(timerId);
+                  const meta = benchClient.getTelemetry();
+                  benchClient.dispose();
+                  resolve({
+                    isWorker: meta.isWorker,
+                    completedFrames: count,
+                    steadyAvgInferMs:
+                      steadyCount > 0 ? Math.round((steadySumMs / steadyCount) * 10) / 10 : 0,
+                    steadyMaxInferMs: Math.round(steadyMaxMs * 10) / 10,
+                    aiFps: lastFps,
+                    delegate: lastDelegate,
+                  });
+                };
+
+                const timeoutId = window.setTimeout(finish, 12000);
+
+                benchClient
+                  .init(
+                    (pkt) => {
+                      count += 1;
+                      // Skip first 3 cold shader/WASM warmup frames to measure true steady-state inferMs
+                      if (count > 3 && pkt.inferMs > 0) {
+                        steadyCount += 1;
+                        steadySumMs += pkt.inferMs;
+                        if (pkt.inferMs > steadyMaxMs) steadyMaxMs = pkt.inferMs;
+                      }
+                      lastFps = pkt.aiFps;
+                      lastDelegate = pkt.delegate;
+                      if (count >= targetFrames) {
+                        finish();
+                      }
+                    },
+                    testEngineMode,
+                  )
+                  .then(() => {
+                    timerId = window.setInterval(() => {
+                      benchClient.submitFrame(vid, performance.now());
+                    }, 33);
+                  })
+                  .catch((err) => {
+                    window.clearTimeout(timeoutId);
+                    benchClient.dispose();
+                    reject(err);
+                  });
+              });
+            },
             getHoveredUiItem: () => hoveredUiItemRef.current,
             getState: () => ({
               mode: settingsRef.current.mode,
@@ -790,7 +928,13 @@ export default function App() {
           // Always boot with the standard system default camera
           const [camStream] = await Promise.all([
             openCameraStream(undefined, savedPreset),
-            trackerClient.init(onWorkerResult),
+            trackerClient.init(
+              onWorkerResult,
+              settingsRef.current.aiEngineMode,
+              (delegate) => {
+                if (!cancelled) setActiveAiDelegate(delegate);
+              },
+            ),
           ]);
           stream = camStream;
         }
@@ -836,9 +980,9 @@ export default function App() {
             const mockLm = generateMockHands(mockPoseRef.current, elapsedSec);
             onWorkerResult({
               landmarks: mockLm,
-              lighting: 'NORMAL',
-              avgLuma: 128,
               aiFps: 30,
+              inferMs: 6,
+              delegate: 'CPU',
             });
           }, 33);
         }
@@ -864,7 +1008,7 @@ export default function App() {
         }
 
         let lastFrameTime = performance.now();
-        let emaDt = 1 / 60;
+        let emaDt = 1 / 120;
         let lastFpsDisplayMs = lastFrameTime;
         let nextRenderTime = lastFrameTime;
 
@@ -878,7 +1022,7 @@ export default function App() {
         let curTiltY = 0;
         let fistHoldSec = 0;
 
-        // Drift-Free Locked 60 FPS Pro Cinema Render Loop
+        // Drift-Free 120 FPS Pro Cinema Render Loop (RTX 3050 45W Optimized)
         const renderLoop = (now: number) => {
           if (cancelled) return;
           rafId = requestAnimationFrame(renderLoop);
@@ -893,13 +1037,13 @@ export default function App() {
             }
           }
 
-          // Steady 60 FPS hardware pacing across all modes
-          if (now < nextRenderTime - 0.25) {
+          // Steady 120 FPS hardware pacing (8.33ms interval; passes through on 60Hz/120Hz cleanly)
+          if (now < nextRenderTime - 0.2) {
             return;
           }
-          nextRenderTime += LOCKED_FPS_INTERVAL_MS;
-          if (now - nextRenderTime > 34) {
-            nextRenderTime = now + LOCKED_FPS_INTERVAL_MS;
+          nextRenderTime += TARGET_FPS_INTERVAL_MS;
+          if (now - nextRenderTime > 20) {
+            nextRenderTime = now + TARGET_FPS_INTERVAL_MS;
           }
 
           const dtSeconds = Math.min(Math.max((now - lastFrameTime) / 1000, 0.001), 0.1);
@@ -909,7 +1053,7 @@ export default function App() {
           if (now - lastFpsDisplayMs >= FPS_UPDATE_INTERVAL_MS) {
             if (fpsTextRef.current) {
               fpsTextRef.current.textContent = String(
-                Math.min(60, Math.round(1 / Math.max(emaDt, 0.001))),
+                Math.min(144, Math.round(1 / Math.max(emaDt, 0.001))),
               ).padStart(2, '0');
             }
             lastFpsDisplayMs = now;
@@ -936,6 +1080,7 @@ export default function App() {
             lastIsHoveringUi,
             overlayCtx,
             swipeIndicatorRef.current,
+            handPacketSeq,
           );
           const renderCostMs = performance.now() - renderStartMs;
           if (isTestMode) {
@@ -1167,12 +1312,12 @@ export default function App() {
         cameras={cameras}
         selectedCameraId={selectedCameraId}
         cameraPreset={cameraPreset}
+        activeAiDelegate={activeAiDelegate}
         onSelectCamera={handleSelectCamera}
         onSelectCameraPreset={handleSelectCameraPreset}
         fpsTextRef={fpsTextRef}
         aiFpsTextRef={aiFpsTextRef}
         modeTextRef={modeTextRef}
-        lowLightDotRef={lowLightDotRef}
         uiRootRef={uiRootRef}
         dockNavRef={dockNavRef}
         toolsOpen={toolsOpen}
